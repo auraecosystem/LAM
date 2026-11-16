@@ -14,7 +14,7 @@ import triton
 import triton.language as tl
 from packaging.version import Version
 
-from fla.utils import IS_AMD, IS_ARM, USE_CUDA_GRAPH, autotune_cache_kwargs, check_pytorch_version, input_guard
+from fla.utils import IS_AMD, IS_ARM, autotune_cache_kwargs, check_pytorch_version, input_guard
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,6 @@ NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [2, 4, 8, 16, 32]
         for BT in [2, 4, 8]
     ],
     key=['BD'],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -64,7 +63,7 @@ def fused_addcmul_fwd_kernel(
     D: tl.constexpr,
     BD: tl.constexpr,
 ):
-    i_b, i_t = tl.program_id(0), tl.program_id(1) * BT
+    i_b, i_t = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64) * BT
 
     bos = i_b * (T + T_OFFSET)
     t_vec = i_t + T_OFFSET + tl.arange(0, BT)
@@ -108,7 +107,6 @@ def fused_addcmul_fwd_kernel(
         for BT in [2, 4, 8]
     ],
     key=['BD'],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -135,7 +133,7 @@ def addcmul_bwd_kernel1(
     BD: tl.constexpr,
     DTYPE: tl.constexpr,
 ):
-    i_b, i_t = tl.program_id(0), tl.program_id(1)
+    i_b, i_t = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
 
     t_idx = T_OFFSET + i_t * BT + tl.arange(0, BT)[:, None]
     mask_t = t_idx < (T + T_OFFSET)
@@ -145,7 +143,7 @@ def addcmul_bwd_kernel1(
     mask = mask_t & mask_d
 
     offset_base = i_b * (T + T_OFFSET) * D
-    x_idx = (offset_base + t_idx * D + d_idx).to(tl.uint32)
+    x_idx = offset_base + t_idx * D + d_idx
 
     b_dxr = tl.load(dxr + x_idx, mask=mask).to(DTYPE)
     b_dxw = tl.load(dxw + x_idx, mask=mask).to(DTYPE)

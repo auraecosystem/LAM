@@ -11,7 +11,7 @@ from einops import rearrange
 
 from fla.modules.backends import dispatch
 from fla.ops.utils import prepare_chunk_indices
-from fla.utils import input_guard
+from fla.utils import deprecate_kwarg, input_guard
 
 from .kernels import (
     causal_conv1d_bwd_kernel,
@@ -32,6 +32,7 @@ def _has_non_standard_layout(x: torch.Tensor) -> bool:
     return stride_d == 1 and stride_t != x.shape[-1]
 
 
+@deprecate_kwarg('BT', version='0.7.0', new_name='chunk_size')
 @dispatch('modules')
 @input_guard(no_guard_contiguous=["x"])
 def causal_conv1d_fwd(
@@ -45,9 +46,10 @@ def causal_conv1d_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     cu_seqlens_cpu: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
-    BT: int = 64,
+    chunk_size: int = 64,
     layout_fallback: bool = False,
 ) -> torch.Tensor:
+    BT = chunk_size
     shape = x.shape
     if x.shape[-1] != weight.shape[0]:
         x = rearrange(x, 'b t ... -> b t (...)')
@@ -104,6 +106,7 @@ def compute_dh0_triton(
     initial_state: torch.Tensor,
     activation: str | None,
     cu_seqlens: torch.Tensor | None,
+    dht: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Compute dh0 (gradient w.r.t. initial_state) using a separate Triton kernel.
@@ -117,21 +120,22 @@ def compute_dh0_triton(
     dh0 = torch.zeros_like(initial_state)
 
     BD = 32
-    grid = (triton.cdiv(D, BD), N)
+    grid = (triton.cdiv(D, BD) * N,)
 
     y_to_pass = y if activation in ('swish', 'silu') else None
-    # dy is [B, T, D], stride_n = T*D, stride_t = D
-    stride_dy_n = dy.stride(0)
-    stride_dy_t = dy.stride(1)
+    # dy is [B, T, D] but may be a strided view; `y` is always contiguous
+    stride_dy_n, stride_dy_t, stride_dy_d = dy.stride()
 
     compute_dh0_kernel[grid](
         dy=dy,
         y=y_to_pass,
         weight=weight,
         dh0=dh0,
+        dht=dht,
         cu_seqlens=cu_seqlens,
         stride_dy_n=stride_dy_n,
         stride_dy_t=stride_dy_t,
+        stride_dy_d=stride_dy_d,
         T=T,
         D=D,
         W=W,
@@ -141,6 +145,7 @@ def compute_dh0_triton(
     return dh0
 
 
+@deprecate_kwarg('BT', version='0.7.0', new_name='chunk_size')
 @dispatch('modules')
 def causal_conv1d_bwd(
     x: torch.Tensor,
@@ -154,9 +159,10 @@ def causal_conv1d_bwd(
     cu_seqlens: torch.Tensor | None = None,
     cu_seqlens_cpu: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
-    BT: int = 64,
+    chunk_size: int = 64,
     layout_fallback: bool = False,
 ):
+    BT = chunk_size
     shape = x.shape
     if x.shape[-1] != weight.shape[0]:
         x = rearrange(x, 'b t ... -> b t (...)')
@@ -239,6 +245,7 @@ def causal_conv1d_bwd(
             initial_state=initial_state,
             activation=activation,
             cu_seqlens=cu_seqlens,
+            dht=dht,
         )
 
     return dx.view(shape), dw, db, dr, dh0
@@ -274,7 +281,7 @@ def causal_conv1d_update_states(
     BD = min(triton.next_power_of_2(D), 256)
     BW = triton.next_power_of_2(W)
 
-    grid = (triton.cdiv(D, BD), N)
+    grid = (triton.cdiv(D, BD) * N,)
 
     causal_conv1d_states_fwd_kernel[grid](
         x=x,
@@ -339,7 +346,7 @@ def causal_conv1d_update(
     elif y.dim() == 3:
         stride_y_n, stride_y_d = y.stride(0), y.stride(2)
 
-    def grid(meta): return (triton.cdiv(D, meta['BD']), N)
+    def grid(meta): return (triton.cdiv(D, meta['BD']) * N,)
 
     causal_conv1d_update_kernel[grid](
         x=x,
@@ -378,9 +385,8 @@ class CausalConv1dFunction(torch.autograd.Function):
         chunk_indices: torch.LongTensor | None = None,
         chunk_size: int = 64,
     ):
-        BT = chunk_size
         if cu_seqlens is not None and chunk_indices is None:
-            chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
+            chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size, cu_seqlens_cpu=cu_seqlens_cpu)
         ctx.activation = activation
         ctx.cu_seqlens = cu_seqlens
         ctx.cu_seqlens_cpu = cu_seqlens_cpu
@@ -398,7 +404,7 @@ class CausalConv1dFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             cu_seqlens_cpu=cu_seqlens_cpu,
             chunk_indices=chunk_indices,
-            BT=BT,
+            chunk_size=chunk_size,
             layout_fallback=ctx.layout_fallback,
         )
         return y, final_state

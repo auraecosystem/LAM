@@ -9,7 +9,25 @@
 
 from __future__ import annotations
 
-from fla.ops.backends import BaseBackend
+import torch
+
+from fla.backends import BaseBackend
+from fla.utils import IS_NPU
+
+# NPU inductor mis-compiles grpo_loss_with_old_logps; keep eager fn from fla.modules.grpo.
+if IS_NPU and not getattr(torch.compile, "_fla_npu_skip_grpo_old_logps_compile", False):
+    _orig_torch_compile = torch.compile
+
+    def _torch_compile(fn=None, /, **kwargs):
+        def _dec(f):
+            if f.__name__ == "grpo_loss_with_old_logps":
+                return f
+            return _orig_torch_compile(f, **kwargs)
+
+        return _dec(fn) if fn is not None else _dec
+
+    _torch_compile._fla_npu_skip_grpo_old_logps_compile = True
+    torch.compile = _torch_compile
 
 
 class TritonAscendBackend(BaseBackend):
@@ -87,9 +105,9 @@ class TritonAscendBackend(BaseBackend):
         from fla.modules.backends.triton_ascend.fused_linear_cross_entropy import (
             logsumexp_fwd_npu,
         )
-        return logsumexp_fwd_npu(x, scale=scale, softcapping=softcapping, dtype=dtype)
+        return logsumexp_fwd_npu(x=x, scale=scale, softcapping=softcapping, dtype=dtype)
 
-    def fused_linear_cross_entropy_forward(
+    def fused_linear_cross_entropy_fwd(
         self,
         x,
         target,
@@ -104,27 +122,30 @@ class TritonAscendBackend(BaseBackend):
         use_l2warp=False,
         l2_penalty_factor=1e-4,
         accumulate_grad_in_fp32=True,
+        process_group=None,
     ):
+        if process_group is not None and torch.distributed.get_world_size(process_group) > 1:
+            raise NotImplementedError("Vocabulary-parallel fused linear cross entropy is not supported by the Ascend backend")
         from fla.modules.backends.triton_ascend.fused_linear_cross_entropy import (
             fused_linear_cross_entropy_forward_npu,
         )
         return fused_linear_cross_entropy_forward_npu(
-            x,
-            target,
-            weight,
-            bias,
-            ignore_index,
-            label_smoothing,
-            logit_scale,
-            logit_softcapping,
-            num_chunks,
-            reduction,
-            use_l2warp,
-            l2_penalty_factor,
-            accumulate_grad_in_fp32,
+            x=x,
+            target=target,
+            weight=weight,
+            bias=bias,
+            ignore_index=ignore_index,
+            label_smoothing=label_smoothing,
+            logit_scale=logit_scale,
+            logit_softcapping=logit_softcapping,
+            num_chunks=num_chunks,
+            reduction=reduction,
+            use_l2warp=use_l2warp,
+            l2_penalty_factor=l2_penalty_factor,
+            accumulate_grad_in_fp32=accumulate_grad_in_fp32,
         )
 
-    def fused_linear_cross_entropy_backward(
+    def fused_linear_cross_entropy_bwd(
         self,
         do,
         dx,
@@ -134,7 +155,10 @@ class TritonAscendBackend(BaseBackend):
         from fla.modules.backends.triton_ascend.fused_linear_cross_entropy import (
             fused_linear_cross_entropy_backward_npu,
         )
-        return fused_linear_cross_entropy_backward_npu(do, dx, dw, db)
+        return fused_linear_cross_entropy_backward_npu(do=do, dx=dx, dw=dw, db=db)
+
+    fused_linear_cross_entropy_forward = fused_linear_cross_entropy_fwd
+    fused_linear_cross_entropy_backward = fused_linear_cross_entropy_bwd
 
     def sigmoid_fwd(self, x, output_contiguous=False):
         from fla.modules.backends.triton_ascend.activations import sigmoid_fwd_npu
@@ -172,7 +196,21 @@ class TritonAscendBackend(BaseBackend):
         from fla.modules.backends.triton_ascend.activations import swiglu_linear_npu
         return swiglu_linear_npu(x, y, weight, bias)
 
-    def fused_kl_div_forward(
+    def powglu_fwd(self, x, y, power=3.0, output_contiguous=False):
+        from fla.modules.backends.triton_ascend.activations import powglu_fwd_npu
+        return powglu_fwd_npu(x, y, power=power, output_contiguous=output_contiguous)
+
+    def powglu_fwdbwd(self, x, y, g, power=3.0, use_weight=False, output_contiguous=False):
+        from fla.modules.backends.triton_ascend.activations import powglu_fwdbwd_npu
+        return powglu_fwdbwd_npu(
+            x, y, g, power=power, use_weight=use_weight, output_contiguous=output_contiguous,
+        )
+
+    def powglu_linear(self, x, y, weight, bias, power=3.0):
+        from fla.modules.backends.triton_ascend.activations import powglu_linear_npu
+        return powglu_linear_npu(x, y, weight, bias, power)
+
+    def fused_kl_div_fwd(
         self,
         x,
         target_x,
@@ -180,20 +218,105 @@ class TritonAscendBackend(BaseBackend):
         target_weight,
         reduction='batchmean',
         accumulate_grad_in_fp32=True,
+        use_dx=True,
+        use_dw=True,
     ):
-        from fla.modules.backends.triton_ascend.fused_kl_div import fused_kl_div_forward_npu
-        return fused_kl_div_forward_npu(
-            x,
-            target_x,
-            weight,
-            target_weight,
-            reduction,
-            accumulate_grad_in_fp32,
+        from fla.modules.backends.triton_ascend.fused_kl_div import fused_kl_div_fwd_npu
+        return fused_kl_div_fwd_npu(
+            x=x,
+            target_x=target_x,
+            weight=weight,
+            target_weight=target_weight,
+            reduction=reduction,
+            accumulate_grad_in_fp32=accumulate_grad_in_fp32,
+            use_dx=use_dx,
+            use_dw=use_dw,
         )
 
-    def fused_kl_div_backward(self, do, dx, dw):
-        from fla.modules.backends.triton_ascend.fused_kl_div import fused_kl_div_backward_npu
-        return fused_kl_div_backward_npu(do, dx, dw)
+    def fused_kl_div_bwd(self, do, dx, dw):
+        from fla.modules.backends.triton_ascend.fused_kl_div import fused_kl_div_bwd_npu
+        return fused_kl_div_bwd_npu(do=do, dx=dx, dw=dw)
+
+    def l2norm_fwd(
+        self,
+        x,
+        eps=1e-6,
+        output_dtype=None,
+    ):
+        from fla.modules.backends.triton_ascend.l2norm import l2norm_fwd_npu
+        return l2norm_fwd_npu(x, eps, output_dtype)
+
+    def l2norm_bwd(
+        self,
+        y,
+        rstd,
+        dy,
+        eps=1e-6,
+    ):
+        from fla.modules.backends.triton_ascend.l2norm import l2norm_bwd_npu
+        return l2norm_bwd_npu(y, rstd, dy)
+
+    def layer_norm_gated_fwd(
+        self,
+        x,
+        g,
+        weight,
+        bias,
+        activation="swish",
+        eps=1e-5,
+        residual=None,
+        out_dtype=None,
+        residual_dtype=None,
+        is_rms_norm=False,
+    ):
+        from fla.modules.backends.triton_ascend.fused_norm_gate import layer_norm_gated_fwd_npu
+        return layer_norm_gated_fwd_npu(
+            x,
+            g,
+            weight,
+            bias,
+            activation,
+            eps,
+            residual,
+            out_dtype,
+            residual_dtype,
+            is_rms_norm,
+        )
+
+    def layer_norm_gated_bwd(
+        self,
+        dy,
+        x,
+        g,
+        weight,
+        bias,
+        activation="swish",
+        eps=1e-5,
+        mean=None,
+        rstd=None,
+        dresidual=None,
+        has_residual=False,
+        is_rms_norm=False,
+        x_dtype=None,
+        recompute_output=False,
+    ):
+        from fla.modules.backends.triton_ascend.fused_norm_gate import layer_norm_gated_bwd_npu
+        return layer_norm_gated_bwd_npu(
+            dy,
+            x,
+            g,
+            weight,
+            bias,
+            activation,
+            eps,
+            mean,
+            rstd,
+            dresidual,
+            has_residual,
+            is_rms_norm,
+            x_dtype,
+            recompute_output,
+        )
 
     def layer_norm_fwd(
         self,
@@ -286,7 +409,7 @@ class TritonAscendBackend(BaseBackend):
         cu_seqlens=None,
         cu_seqlens_cpu=None,
         chunk_indices=None,
-        BT=64,
+        chunk_size=64,
         layout_fallback=False,
     ):
         from fla.modules.backends.triton_ascend.causal_conv1d import causal_conv1d_fwd_npu
@@ -301,7 +424,7 @@ class TritonAscendBackend(BaseBackend):
             cu_seqlens,
             cu_seqlens_cpu,
             chunk_indices,
-            BT,
+            chunk_size,
             layout_fallback,
         )
 
@@ -318,7 +441,7 @@ class TritonAscendBackend(BaseBackend):
         cu_seqlens=None,
         cu_seqlens_cpu=None,
         chunk_indices=None,
-        BT=64,
+        chunk_size=64,
         layout_fallback=False,
     ):
         from fla.modules.backends.triton_ascend.causal_conv1d import causal_conv1d_bwd_npu
@@ -334,7 +457,7 @@ class TritonAscendBackend(BaseBackend):
             cu_seqlens,
             cu_seqlens_cpu,
             chunk_indices,
-            BT,
+            chunk_size,
             layout_fallback,
         )
 
@@ -346,6 +469,7 @@ class TritonAscendBackend(BaseBackend):
         initial_state,
         activation,
         cu_seqlens,
+        dht=None,
     ):
         from fla.modules.backends.triton_ascend.causal_conv1d import compute_dh0_npu
         return compute_dh0_npu(
@@ -355,6 +479,7 @@ class TritonAscendBackend(BaseBackend):
             initial_state,
             activation,
             cu_seqlens,
+            dht,
         )
 
     def causal_conv1d_update_states(

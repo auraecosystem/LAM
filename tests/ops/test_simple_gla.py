@@ -317,6 +317,76 @@ def test_chunk(
 
 
 @pytest.mark.parametrize(
+    ('B', 'T', 'H', 'D', 'scale', 'gate_logit_normalizer', 'dtype', 'chunk_size'),
+    [
+        pytest.param(*test, id="B{}-T{}-H{}-D{}-scale{}-gate{}-{}-chunk{}".format(*test))
+        for chunk_size in [16, 32, 64]
+        for test in [
+            (1, 64, 2, 64, 0.1, 1.0, torch.float16, chunk_size),
+        ]
+    ],
+)
+def test_chunk_with_chunk_size(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    gate_logit_normalizer: float,
+    dtype: torch.dtype,
+    chunk_size: int,
+):
+    torch.manual_seed(42)
+    q = torch.randn(B, T, H, D, dtype=dtype, device=device)
+    k = torch.randn(B, T, H, D, dtype=dtype, device=device)
+    v = torch.randn(B, T, H, D, dtype=dtype, device=device)
+    g = F.logsigmoid(torch.randn(B, T, H, dtype=torch.float32, device=device)) / gate_logit_normalizer
+    h0 = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+    do = torch.randn_like(v)
+    dht = torch.randn_like(h0)
+
+    def run_ref():
+        q_, k_, v_, g_, h0_ = (x.detach().clone().requires_grad_(True) for x in (q, k, v, g, h0))
+        o, ht = fused_recurrent_simple_gla(
+            q=q_,
+            k=k_,
+            v=v_,
+            g=g_,
+            scale=scale,
+            initial_state=h0_,
+            output_final_state=True,
+        )
+        ((o * do).sum() + (ht * dht).sum()).backward()
+        return o, ht, q_.grad, k_.grad, v_.grad, g_.grad, h0_.grad
+
+    def run_tri(chunk_size: int):
+        q_, k_, v_, g_, h0_ = (x.detach().clone().requires_grad_(True) for x in (q, k, v, g, h0))
+        o, ht = chunk_simple_gla(
+            q=q_,
+            k=k_,
+            v=v_,
+            g=g_,
+            scale=scale,
+            initial_state=h0_,
+            output_final_state=True,
+            chunk_size=chunk_size,
+        )
+        ((o * do).sum() + (ht * dht).sum()).backward()
+        return o, ht, q_.grad, k_.grad, v_.grad, g_.grad, h0_.grad
+
+    ref_o, ref_ht, ref_dq, ref_dk, ref_dv, ref_dg, ref_dh0 = run_ref()
+    tri_o, tri_ht, tri_dq, tri_dk, tri_dv, tri_dg, tri_dh0 = run_tri(chunk_size)
+
+    assert_close(f'o@{chunk_size}', ref_o, tri_o, 0.005)
+    assert_close(f'ht@{chunk_size}', ref_ht, tri_ht, 0.005)
+    assert_close(f'dq@{chunk_size}', ref_dq, tri_dq, 0.005)
+    assert_close(f'dk@{chunk_size}', ref_dk, tri_dk, 0.005)
+    assert_close(f'dv@{chunk_size}', ref_dv, tri_dv, 0.005)
+    assert_close(f'dg@{chunk_size}', ref_dg, tri_dg, 0.005)
+    assert_close(f'dh0@{chunk_size}', ref_dh0, tri_dh0, 0.005)
+
+
+@pytest.mark.parametrize(
     ('B', 'T', 'H', 'D', 'dtype'),
     [
         pytest.param(*test, id="B{}-T{}-H{}-D{}-{}".format(*test))
@@ -379,6 +449,8 @@ def test_chunk_state_v_first(
             (4, 64, [0, 15], torch.float16),
             (4, 64, [0, 256, 500, 1000], torch.float16),
             (4, 100, [0, 15, 100, 300, 1200, 2000], torch.float16),
+            # exceed the 65535-block limit on grid axes 1 and 2
+            (32, 32, range(0, 32801, 16), torch.float16),
         ]
     ],
 )
@@ -386,10 +458,11 @@ def test_chunk_state_v_first(
     os.getenv('SKIP_TEST_CHUNK_VARLEN') == '1',
     reason='Skipping test_chunk_varlen because SKIP_TEST_CHUNK_VARLEN is set',
 )
+@pytest.mark.smoke
 def test_chunk_varlen(
     H: int,
     D: int,
-    cu_seqlens: list[int],
+    cu_seqlens: list[int] | range,
     dtype: torch.dtype,
 ):
     torch.manual_seed(42)
@@ -773,7 +846,6 @@ def test_simple_gla_to_mamba2(vary_A, dtype):
         assert final_ssd.allclose(final_fuse, 0, atol), f'final diff: {torch.abs(final_ssd - final_fuse).max()}'
 
     # mapping inputs Mamba2 -> FLA
-    # FLA Now use head_first = False, therefore there is no need to transpose inputs
     q = C
     k = B
     v = x

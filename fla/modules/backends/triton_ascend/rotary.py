@@ -13,6 +13,16 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.utils import autotune_cache_kwargs, get_multiprocessor_count
+from fla.utils.ascend_ub_manager import (
+    ASCEND_MAX_GRID_DIM,
+    compute_grid_limited_tile_size,
+    compute_row_tile_block_size,
+    max_grid_axis_chunks,
+)
+
+# Peak live fp32 tiles in rotary kernel: cos, sin, x0, x1, o0, o1.
+_ROTARY_MEM_MULT = 6.0
+_ROTARY_SAFETY_MARGIN = 0.90
 
 # Ascend vector UB is small; large num_warps / stages explodes compile-time UB (see bishengir ub overflow).
 NUM_WARPS_AUTOTUNE = [2, 4]
@@ -49,19 +59,21 @@ def rotary_embedding_kernel(
     IS_VARLEN: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     CONJUGATE: tl.constexpr,
+    NT_OFFSET: tl.constexpr,
 ):
     i_t, i_b, i_h = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_t += NT_OFFSET
 
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n), tl.load(cu_seqlens + i_n + 1)
-        T = eos - bos
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T = (eos - bos).to(tl.int32)
         x = x + bos * H*D + i_h * D
         y = y + bos * H*D + i_h * D
     else:
         i_n = i_b
-        x = x + i_n * T*H*D + i_h * D
-        y = y + i_n * T*H*D + i_h * D
+        x = x + tl.cast(i_n, tl.int64) * T * H * D + i_h * D
+        y = y + tl.cast(i_n, tl.int64) * T * H * D + i_h * D
 
     if i_t * BT >= T:
         return
@@ -133,7 +145,9 @@ def rotary_embedding_fwdbwd_npu(
     R2 = R * 2
 
     assert D <= 256, "Only support D <= 256"
-    assert TR >= T, f"TR must be >= T, got {TR} and {T}"
+    assert R2 <= D, f"Rotary dimension must not exceed head dimension, got rotary_dim={R2} and head_dim={D}"
+    if not is_varlen:
+        assert TR >= T, f"TR must be >= T, got {TR} and {T}"
 
     assert cos.dtype == sin.dtype, f"cos and sin must have the same dtype, got {cos.dtype} and {sin.dtype}"
     assert x.dtype == cos.dtype, f"Input and cos/sin must have the same dtype, got {x.dtype} and {cos.dtype}"
@@ -141,35 +155,43 @@ def rotary_embedding_fwdbwd_npu(
     if isinstance(seqlen_offsets, torch.Tensor):
         assert seqlen_offsets.shape == (N,)
         assert seqlen_offsets.dtype in [torch.int32, torch.int64]
+        sequence_lengths = T if not is_varlen else cu_seqlens[1:] - cu_seqlens[:-1]
+        torch._assert_async(
+            torch.all(sequence_lengths + seqlen_offsets <= TR),
+            f"Rotary cache is too short for tensor offsets, got {TR} positions",
+        )
     else:
         assert seqlen_offsets + T <= TR
 
-    y = torch.empty_like(x) if not inplace else x
+    y = torch.zeros_like(x) if not inplace else x
     if R2 < D and not inplace:
         y[..., R2:].copy_(x[..., R2:])
 
     BD = triton.next_power_of_2(R2)
-    # GPU: one program loads a [BT, R] tile of cos/sin/x in fp32; Ascend UB (~192KiB) overflows for BT=128, R=128.
-    if R >= 128:
-        bt_cap = 16
-    elif R >= 64:
-        bt_cap = 32
-    else:
-        bt_cap = 64
-    BT = min(bt_cap, triton.next_power_of_2(triton.cdiv(T, get_multiprocessor_count(x.device.index))))
+    desired_bt = triton.next_power_of_2(triton.cdiv(T, get_multiprocessor_count(x.device.index)))
+    bt_cap = compute_row_tile_block_size(
+        desired_bt,
+        R2,
+        _ROTARY_MEM_MULT,
+        safety_margin=_ROTARY_SAFETY_MARGIN,
+        dtype_size=x.element_size(),
+        fallback=16 if R >= 128 else (32 if R >= 64 else 64),
+        min_block=1,
+    )
+    BT = min(bt_cap, desired_bt)
+    BT = compute_grid_limited_tile_size(T, B * H, BT, max_grid=ASCEND_MAX_GRID_DIM)
     if chunk_indices is None and is_varlen:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = len(chunk_indices) if is_varlen else triton.cdiv(T, BT)
 
-    grid = (NT, B, H)
-    rotary_embedding_kernel[grid](
-        x,
-        cos,
-        sin,
-        y,
-        cu_seqlens,
-        chunk_indices,
-        seqlen_offsets,
+    kernel_kwargs = dict(
+        x=x,
+        cos=cos,
+        sin=sin,
+        y=y,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        seq_offsets=seqlen_offsets,
         B=B,
         T=T,
         H=H,
@@ -183,4 +205,14 @@ def rotary_embedding_fwdbwd_npu(
         INTERLEAVED=interleaved,
         CONJUGATE=conjugate,
     )
+    max_nt = max_grid_axis_chunks(NT, B * H, max_grid=ASCEND_MAX_GRID_DIM)
+    for nt_off in range(0, NT, max_nt):
+        nt_len = min(max_nt, NT - nt_off)
+        if is_varlen:
+            kernel_kwargs['chunk_indices'] = chunk_indices[nt_off:nt_off + nt_len]
+            kernel_kwargs['NT_OFFSET'] = 0
+        else:
+            kernel_kwargs['chunk_indices'] = chunk_indices
+            kernel_kwargs['NT_OFFSET'] = nt_off
+        rotary_embedding_kernel[(nt_len, B, H)](**kernel_kwargs)
     return y

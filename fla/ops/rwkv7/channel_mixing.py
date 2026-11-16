@@ -12,7 +12,6 @@ import triton
 import triton.language as tl
 
 from fla.utils import (
-    USE_CUDA_GRAPH,
     autocast_custom_bwd,
     autocast_custom_fwd,
     autotune_cache_kwargs,
@@ -32,7 +31,6 @@ if not check_pytorch_version('2.4'):
         for block_size in [128, 256, 512, 1024, 2048, 4096, 8192]
     ],
     key=['hidden_dim'],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -46,7 +44,7 @@ def rwkv_seq_mix_kernel(
     hidden_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    block_start = tl.program_id(0) * BLOCK_SIZE
+    block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
     block_idx = block_start + tl.arange(0, BLOCK_SIZE)[:]
 
     total_seq_dim = token_length * hidden_dim
@@ -84,16 +82,18 @@ def rwkv_seq_mix_kernel(
 def rwkv_channel_mixing_pow_and_relu(
     in_ptr,
     out_ptr,
+    n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Fused ReLU and Power operation: x = ReLU(x)^2"""
-    xoffset = tl.program_id(0) * BLOCK_SIZE
+    xoffset = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
     xindex = xoffset + tl.arange(0, BLOCK_SIZE)
     x0 = xindex
-    x = tl.load(in_ptr + (x0), None)
+    xmask = xindex < n_elements
+    x = tl.load(in_ptr + (x0), mask=xmask, other=0.0)
     x = tl.maximum(x, 0.0).to(tl.float32)
     x = tl.cast(x * x, dtype=out_ptr.dtype.element_ty, fp_downcast_rounding='rtne')
-    tl.store(out_ptr + (x0), x, None)
+    tl.store(out_ptr + (x0), x, mask=xmask)
 
 
 def rwkv_mix_torch(x: torch.Tensor, x_prev: torch.Tensor, x_k: torch.Tensor):
@@ -164,6 +164,7 @@ def rwkv_relu_and_square_fwd(x: torch.Tensor, inplace: bool = True):
     rwkv_channel_mixing_pow_and_relu[grid](
         x,
         output,
+        output.numel(),
         BLOCK_SIZE=4096,
     )
 
@@ -174,23 +175,25 @@ def rwkv_relu_and_square_fwd(x: torch.Tensor, inplace: bool = True):
 def relu_square_bwd_kernel(
     out_ptr,
     forward_input_ptr,
+    n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
     """ReLU(x)^2 backward kernel
     grad_input = grad_output * 2 * x if x > 0 else 0
     """
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
 
-    x = tl.load(forward_input_ptr + offsets).to(tl.float32)
-    grad = tl.load(out_ptr + offsets).to(tl.float32)
+    x = tl.load(forward_input_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    grad = tl.load(out_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
 
     x = tl.maximum(x, 0.0)
 
     grad_input = grad * 2 * x
 
-    tl.store(out_ptr + offsets, grad_input.to(out_ptr.dtype.element_ty))
+    tl.store(out_ptr + offsets, grad_input.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.autotune(
@@ -199,7 +202,6 @@ def relu_square_bwd_kernel(
         for block_size in [128, 256, 512, 1024, 2048, 4096, 8192]
     ],
     key=['hidden_dim'],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -213,7 +215,7 @@ def rwkv_mix_bwd_kenel(
     hidden_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 
     batch_idx = offsets // (token_length * hidden_dim)
@@ -221,7 +223,7 @@ def rwkv_mix_bwd_kenel(
     seq_idx = seq_feat // hidden_dim
     feat_idx = seq_feat % hidden_dim
 
-    is_valid = offsets < (batch_size * token_length * hidden_dim)
+    is_valid = offsets < (tl.cast(batch_size, tl.int64) * token_length * hidden_dim)
 
     dk1 = tl.load(dk1_ptr0 + offsets, mask=is_valid)
     xk = tl.load(xk_ptr + feat_idx, mask=is_valid)
@@ -241,7 +243,7 @@ def rwkv_mix_bwd_kenel(
     tl.store(
         dx_prev_ptr + dx_prev_offset,
         tl.cast(prod, dtype=dx_prev_ptr.dtype.element_ty),
-        mask=is_first_step,
+        mask=is_first_step & is_valid,
     )
 
 
@@ -275,6 +277,7 @@ def rwkv_channel_mixing_bwd(grad_output, x, x_prev, x_k, key_weight, value_weigh
     relu_square_bwd_kernel[grid](
         dk,
         k1_K,
+        dk.numel(),
         BLOCK_SIZE=BLOCK_SIZE,
     )
 

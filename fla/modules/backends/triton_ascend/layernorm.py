@@ -11,17 +11,38 @@ import torch
 import triton
 import triton.language as tl
 
-from fla.utils import autotune_cache_kwargs, get_multiprocessor_count
+from fla.utils import get_multiprocessor_count
+from fla.utils.ascend_ub_manager import ASCEND_MAX_GRID_DIM, compute_ub_block_size, iter_axis_launch_chunks
 
-# Ascend vector UB is small; avoid make_block_ptr tiled kernels and large warp counts.
-NUM_WARPS_AUTOTUNE = [2, 4]
+# Peak live fp32 vectors in row-wise kernel1 (see Liger Ascend layer_norm).
+_FWD_MEM_MULT = 6.0
+_BWD_MEM_MULT = 8.0
+_UB_SAFETY_MARGIN = 0.85
+# Legacy byte cap when UB capacity cannot be detected (65536 // fp32).
+_FALLBACK_MAX_BD = 65536 // 4
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in NUM_WARPS_AUTOTUNE],
-    key=['D', 'IS_RMS_NORM'],
-    **autotune_cache_kwargs,
-)
+def _get_layer_norm_bd(D: int, is_forward: bool) -> int:
+    """Return power-of-2 block size for feature dim D under UB constraints."""
+    memory_multiplier = _FWD_MEM_MULT if is_forward else _BWD_MEM_MULT
+    return compute_ub_block_size(
+        D,
+        memory_multiplier,
+        safety_margin=_UB_SAFETY_MARGIN,
+        fallback=_FALLBACK_MAX_BD,
+        desired=triton.next_power_of_2(D),
+    )
+
+
+def _layer_norm_bwd_launch_config(T: int, G: int, device_index: int) -> tuple[int, int, int]:
+    """Return (NS, BS, GS) capped under Ascend grid limit."""
+    NS = min(triton.cdiv(get_multiprocessor_count(device_index), G), T // G) * G
+    NS = min(NS, ASCEND_MAX_GRID_DIM)
+    BS = triton.cdiv(T, NS) if NS > 0 else T
+    GS = NS // G if G > 0 else NS
+    return NS, BS, GS
+
+
 @triton.jit
 def layer_norm_fwd_kernel1(
     x,
@@ -45,12 +66,12 @@ def layer_norm_fwd_kernel1(
     i_t = tl.program_id(0)
     i_g = i_t % G
 
-    x += i_t * D
-    y += i_t * D
+    x += tl.cast(i_t, tl.int64) * D
+    y += tl.cast(i_t, tl.int64) * D
     if HAS_RESIDUAL:
-        res += i_t * D
+        res += tl.cast(i_t, tl.int64) * D
     if STORE_RESIDUAL_OUT:
-        res_out += i_t * D
+        res_out += tl.cast(i_t, tl.int64) * D
 
     o_d = tl.arange(0, BD)
     m_d = o_d < D
@@ -85,11 +106,6 @@ def layer_norm_fwd_kernel1(
 @triton.heuristics({
     'RECOMPUTE_OUTPUT': lambda args: args['y'] is not None,
 })
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in NUM_WARPS_AUTOTUNE],
-    key=['D', 'HAS_DRESIDUAL', 'STORE_DRESIDUAL', 'IS_RMS_NORM'],
-    **autotune_cache_kwargs,
-)
 @triton.jit
 def layer_norm_bwd_kernel1(
     x,
@@ -132,8 +148,8 @@ def layer_norm_bwd_kernel1(
         b_db = tl.zeros((BD,), dtype=tl.float32)
 
     for i_t in range(i_sg * BS * G + i_g, min((i_sg * BS + BS) * G + i_g, T), G):
-        b_x = tl.load(x + i_t * D + o_d, mask=mask, other=0).to(tl.float32)
-        b_dy = tl.load(dy + i_t * D + o_d, mask=mask, other=0).to(tl.float32)
+        b_x = tl.load(x + tl.cast(i_t, tl.int64) * D + o_d, mask=mask, other=0).to(tl.float32)
+        b_dy = tl.load(dy + tl.cast(i_t, tl.int64) * D + o_d, mask=mask, other=0).to(tl.float32)
 
         if not IS_RMS_NORM:
             b_mean = tl.load(mean + i_t)
@@ -144,7 +160,7 @@ def layer_norm_bwd_kernel1(
             b_y = b_xhat * b_w if HAS_WEIGHT else b_xhat
             if HAS_BIAS:
                 b_y = b_y + b_b
-            tl.store(y + i_t * D + o_d, b_y, mask=mask)
+            tl.store(y + tl.cast(i_t, tl.int64) * D + o_d, b_y, mask=mask)
         b_wdy = b_dy
         if HAS_WEIGHT:
             b_wdy = b_dy * b_w
@@ -159,17 +175,54 @@ def layer_norm_bwd_kernel1(
             b_c1 = tl.sum(b_xhat * b_wdy, axis=0) / D
             b_dx = (b_wdy - b_xhat * b_c1) * b_rstd
         if HAS_DRESIDUAL:
-            b_dres = tl.load(dres + i_t * D + o_d, mask=mask, other=0).to(tl.float32)
+            b_dres = tl.load(dres + tl.cast(i_t, tl.int64) * D + o_d, mask=mask, other=0).to(tl.float32)
             b_dx += b_dres
         b_dx = tl.cast(b_dx, dtype=dx.dtype.element_ty, fp_downcast_rounding='rtne')
         if STORE_DRESIDUAL:
-            tl.store(dres_in + i_t * D + o_d, b_dx, mask=mask)
-        tl.store(dx + i_t * D + o_d, b_dx, mask=mask)
+            tl.store(dres_in + tl.cast(i_t, tl.int64) * D + o_d, b_dx, mask=mask)
+        tl.store(dx + tl.cast(i_t, tl.int64) * D + o_d, b_dx, mask=mask)
 
     if HAS_WEIGHT:
         tl.store(dw + i_s * D + o_d, b_dw, mask=mask)
     if HAS_BIAS:
         tl.store(db + i_s * D + o_d, b_db, mask=mask)
+
+
+def _launch_layer_norm_fwd_kernel1(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    residual: torch.Tensor,
+    res_out: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    eps: float,
+    G: int,
+    D: int,
+    BD: int,
+    is_rms_norm: bool,
+):
+    chunk_T = x.shape[0]
+    layer_norm_fwd_kernel1[(chunk_T,)](
+        x,
+        y,
+        weight,
+        bias,
+        residual,
+        res_out,
+        mean,
+        rstd,
+        eps,
+        G=G,
+        D=D,
+        BD=BD,
+        IS_RMS_NORM=is_rms_norm,
+        HAS_RESIDUAL=residual is not None,
+        STORE_RESIDUAL_OUT=res_out is not None,
+        HAS_WEIGHT=weight is not None,
+        HAS_BIAS=bias is not None,
+    )
 
 
 def layer_norm_fwd_npu(
@@ -201,31 +254,32 @@ def layer_norm_fwd_npu(
     mean = torch.empty((T,), dtype=torch.float, device=x.device) if not is_rms_norm else None
     rstd = torch.empty((T,), dtype=torch.float, device=x.device)
 
-    MAX_FUSED_SIZE = 65536 // x.element_size()
-    BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
+    BD = _get_layer_norm_bd(D, is_forward=True)
     if D > BD:
-        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+        raise RuntimeError(
+            f"LayerNorm feature dim {D} exceeds UB-safe block size {BD}. "
+            "Column-tiled kernels are not yet implemented for this size."
+        )
 
     # Ascend: use row-wise kernel1 (no make_block_ptr) for all feature dims.
-    layer_norm_fwd_kernel1[(T,)](
-        x,
-        y,
-        weight,
-        bias,
-        residual,
-        res_out,
-        mean,
-        rstd,
-        eps,
-        G=G,
-        D=D,
-        BD=BD,
-        IS_RMS_NORM=is_rms_norm,
-        HAS_RESIDUAL=residual is not None,
-        STORE_RESIDUAL_OUT=res_out is not None,
-        HAS_WEIGHT=weight is not None,
-        HAS_BIAS=bias is not None,
-    )
+    # Split along rows when T exceeds the Ascend grid limit.
+    for row_start, row_len in iter_axis_launch_chunks(T, 1, max_grid=ASCEND_MAX_GRID_DIM):
+        row_end = row_start + row_len
+        _launch_layer_norm_fwd_kernel1(
+            x[row_start:row_end],
+            y[row_start:row_end],
+            weight,
+            bias,
+            None if residual is None else residual[row_start:row_end],
+            None if res_out is None else res_out[row_start:row_end],
+            None if mean is None else mean[row_start:row_end],
+            rstd[row_start:row_end],
+            eps,
+            G,
+            D,
+            BD,
+            is_rms_norm,
+        )
     return y, mean, rstd, res_out if res_out is not None else x
 
 
@@ -256,14 +310,14 @@ def layer_norm_bwd_npu(
     dres_in = torch.empty_like(x) if has_residual and dx.dtype != x.dtype else None
     y = torch.empty(T, D, dtype=dy.dtype, device=dy.device) if recompute_output else None
 
-    MAX_FUSED_SIZE = 65536 // x.element_size()
-    BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
+    BD = _get_layer_norm_bd(D, is_forward=False)
     if D > BD:
-        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+        raise RuntimeError(
+            f"LayerNorm feature dim {D} exceeds UB-safe block size {BD}. "
+            "Column-tiled kernels are not yet implemented for this size."
+        )
 
-    NS = min(triton.cdiv(get_multiprocessor_count(x.device.index), G), T // G) * G
-    BS = triton.cdiv(T, NS)
-    GS = NS // G
+    NS, BS, GS = _layer_norm_bwd_launch_config(T, G, x.device.index)
 
     dw = torch.empty((NS, D), dtype=torch.float, device=weight.device) if weight is not None else None
     db = torch.empty((NS, D), dtype=torch.float, device=bias.device) if bias is not None else None

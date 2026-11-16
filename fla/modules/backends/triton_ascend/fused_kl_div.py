@@ -13,8 +13,10 @@ import triton
 import triton.language as tl
 
 from fla.ops.utils.op import exp, log
+from fla.utils.ascend_ub_manager import ASCEND_MAX_GRID_DIM, compute_elementwise_block_size, compute_vocab_block_size
 
-MAX_FUSED_SIZE = 65536 // 2
+_KLD_FWD_MEM_MULT = 12.0
+_ELEMENTWISE_MEM_MULT = 2.5
 STATIC_WARPS = 2
 
 
@@ -87,39 +89,38 @@ def elementwise_mul_kernel(
     o_x = i_x * B + tl.arange(0, B)
 
     b_g = tl.load(g)
+    if b_g == 1.0:
+        return
     b_x = tl.load(x + o_x, mask=o_x < N)
     tl.store(x + o_x, b_x * b_g, mask=o_x < N)
 
 
 def _npu_vocab_block_size(vocab_size: int, num_rows: int) -> int:
-    block_size = 1024 if vocab_size <= 32768 else (2048 if vocab_size <= 131072 else 4096)
-    max_splits = max(1, 65535 // max(num_rows, 1))
-    return min(
-        max(block_size, triton.next_power_of_2((vocab_size + max_splits - 1) // max_splits)),
-        8192,
-    )
+    return compute_vocab_block_size(vocab_size=vocab_size, num_rows=num_rows, memory_multiplier=_KLD_FWD_MEM_MULT)
 
 
-def fused_kl_div_forward_npu(
+def fused_kl_div_fwd_npu(
     x: torch.Tensor,
     target_x: torch.Tensor,
     weight: torch.Tensor,
     target_weight: torch.Tensor,
     reduction: str = 'batchmean',
     accumulate_grad_in_fp32: bool = True,
+    use_dx: bool = True,
+    use_dw: bool = True,
 ):
     device = x.device
 
     N, H, V = *x.shape, weight.shape[0]
-    BV = _npu_vocab_block_size(V, N)
+    BV = _npu_vocab_block_size(vocab_size=V, num_rows=N)
     NC = min(8, triton.cdiv(V, H))
-    C = triton.next_power_of_2(triton.cdiv(N, NC))
+    C = min(triton.next_power_of_2(triton.cdiv(N, NC)), ASCEND_MAX_GRID_DIM)
     NC = triton.cdiv(N, C)
 
     grad_dtype = torch.float32 if accumulate_grad_in_fp32 else weight.dtype
 
-    dx = torch.zeros_like(x, device=device)
-    dw = torch.zeros_like(weight, device=device, dtype=grad_dtype) if weight is not None else None
+    dx = torch.zeros_like(x, device=device) if use_dx else None
+    dw = torch.zeros_like(weight, device=device, dtype=grad_dtype) if use_dw else None
     loss = torch.zeros(N, dtype=torch.float32, device=device)
 
     for ic in range(NC):
@@ -128,7 +129,7 @@ def fused_kl_div_forward_npu(
         c_tx = target_x[start:end]
         c_sl = F.linear(c_sx, weight)
         c_tl = F.linear(c_tx, target_weight)
-        if weight is not None and c_sx.dtype != grad_dtype:
+        if dw is not None and c_sx.dtype != grad_dtype:
             c_sx = c_sx.to(dtype=grad_dtype)
 
         c_loss = loss[start:end]
@@ -147,9 +148,10 @@ def fused_kl_div_forward_npu(
         )
 
         c_grad = c_sl if c_sl.is_contiguous() else c_sl.contiguous()
-        dx[start:end] = torch.mm(c_grad, weight)
+        if dx is not None:
+            dx[start:end] = torch.mm(c_grad, weight)
 
-        if weight is not None:
+        if dw is not None:
             grad_w = c_grad.t().to(dtype=grad_dtype)
             grad_x = c_sx if c_sx.dtype == grad_dtype else c_sx.to(dtype=grad_dtype)
             dw.add_(grad_w @ grad_x)
@@ -160,32 +162,22 @@ def fused_kl_div_forward_npu(
     return loss, dx, dw
 
 
-def fused_kl_div_backward_npu(
+def fused_kl_div_bwd_npu(
     do: torch.Tensor,
-    dx: torch.Tensor,
-    dw: torch.Tensor,
+    dx: torch.Tensor | None,
+    dw: torch.Tensor | None,
 ):
-    if torch.ne(do, torch.tensor(1.0, device=do.device)):
-        N, H = dx.shape
-        B = min(MAX_FUSED_SIZE, max(1024, triton.next_power_of_2((N * H + 65534) // 65535)))
-
+    for grad in (dx, dw):
+        if grad is None:
+            continue
+        N, H = grad.shape
+        B = compute_elementwise_block_size(n_elements=N * H, memory_multiplier=_ELEMENTWISE_MEM_MULT)
         elementwise_mul_kernel[(triton.cdiv(N * H, B),)](
-            x=dx,
+            x=grad,
             g=do,
             N=N*H,
             B=B,
             num_warps=STATIC_WARPS,
         )
-
-        if dw is not None:
-            V, H = dw.shape
-            B_dw = min(MAX_FUSED_SIZE, max(1024, triton.next_power_of_2((V * H + 65534) // 65535)))
-            elementwise_mul_kernel[(triton.cdiv(V * H, B_dw),)](
-                x=dw,
-                g=do,
-                N=V*H,
-                B=B_dw,
-                num_warps=STATIC_WARPS,
-            )
 
     return dx, dw

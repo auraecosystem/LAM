@@ -16,12 +16,27 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+import triton.language.extra.libdevice as tldevice
 
 from fla.modules.backends import dispatch
 from fla.ops.utils.op import exp, log
-from fla.utils import IS_AMD, autocast_custom_bwd, autocast_custom_fwd, autotune_cache_kwargs, input_guard
+from fla.utils import IS_AMD, IS_INTEL, IS_NPU, autocast_custom_bwd, autocast_custom_fwd, autotune_cache_kwargs, input_guard
 
-NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
+
+def _activation_autotune_configs():
+    """Return autotune configs scaled to the device's scratch-space budget."""
+    if IS_INTEL:
+        # Intel/XPU has a smaller per-thread scratch space (PTSS) limit; smaller
+        # block sizes and warp counts avoid register spilling on larger D.
+        bs_list = [512, 1024]
+        nw_list = [1, 2, 4, 8]
+    elif IS_AMD:
+        bs_list = [512, 1024, 2048, 4096, 8192]
+        nw_list = [1, 2, 4, 8, 16]
+    else:
+        bs_list = [512, 1024, 2048, 4096, 8192]
+        nw_list = [1, 2, 4, 8, 16, 32]
+    return [triton.Config({'B': bs}, num_warps=nw) for bs in bs_list for nw in nw_list]
 
 
 def _get_stride(x: torch.Tensor) -> int:
@@ -33,6 +48,8 @@ def _get_stride(x: torch.Tensor) -> int:
     """
     if x.ndim < 2:
         return 0
+    if torch.compiler.is_compiling():
+        return x.shape[-1]
     return x.stride(-2)
 
 
@@ -69,6 +86,8 @@ def _is_inner_contiguous(x: torch.Tensor) -> bool:
 
 def _ensure_inner_contiguous(x: torch.Tensor) -> torch.Tensor:
     """Make the tensor inner-contiguous if it isn't already."""
+    if torch.compiler.is_compiling():
+        return x.contiguous()
     if _is_inner_contiguous(x):
         return x
     return x.contiguous()
@@ -86,11 +105,7 @@ def _alloc_output(x: torch.Tensor, contiguous: bool = False) -> torch.Tensor:
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({'B': bs}, num_warps=num_warps)
-        for bs in [512, 1024, 2048, 4096, 8192]
-        for num_warps in NUM_WARPS_AUTOTUNE
-    ],
+    configs=_activation_autotune_configs(),
     key=['D'],
     **autotune_cache_kwargs,
 )
@@ -114,11 +129,7 @@ def sigmoid_fwd_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({'B': bs}, num_warps=num_warps)
-        for bs in [512, 1024, 2048, 4096, 8192]
-        for num_warps in NUM_WARPS_AUTOTUNE
-    ],
+    configs=_activation_autotune_configs(),
     key=['D'],
     **autotune_cache_kwargs,
 )
@@ -145,7 +156,6 @@ def sigmoid_bwd_kernel(
 
 
 @dispatch('modules')
-@torch.compiler.disable
 def sigmoid_fwd(x: torch.Tensor, output_contiguous: bool = False) -> torch.Tensor:
     x = _ensure_inner_contiguous(x)
     T, D = x.numel(), x.shape[-1]
@@ -162,7 +172,6 @@ def sigmoid_fwd(x: torch.Tensor, output_contiguous: bool = False) -> torch.Tenso
 
 
 @dispatch('modules')
-@torch.compiler.disable
 def sigmoid_bwd(x: torch.Tensor, dy: torch.Tensor, output_contiguous: bool = False) -> torch.Tensor:
     x = _ensure_inner_contiguous(x)
     dy = _ensure_inner_contiguous(dy)
@@ -200,11 +209,120 @@ sigmoid = SigmoidFunction.apply
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({'B': bs}, num_warps=num_warps)
-        for bs in [512, 1024, 2048, 4096, 8192]
-        for num_warps in NUM_WARPS_AUTOTUNE
-    ],
+    configs=_activation_autotune_configs(),
+    key=['D'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def elu_p1_fwd_kernel(
+    x, y,
+    stride_x_row,
+    stride_y_row,
+    T,
+    D: tl.constexpr,
+    B: tl.constexpr,
+):
+    i_n = tl.program_id(0).to(tl.int64)
+    offs = i_n * B + tl.arange(0, B)
+    mask = offs < T
+    row = offs // D
+    col = offs % D
+    b_x = tl.load(x + row * stride_x_row + col, mask=mask, other=0.).to(tl.float32)
+    # libdevice preserves representable subnormal exponentials
+    b_y = tl.where(b_x >= 0, b_x + 1., tldevice.exp(tl.minimum(b_x, 0.)))
+    tl.store(y + row * stride_y_row + col, b_y.to(y.dtype.element_ty), mask=mask)
+
+
+@triton.autotune(
+    configs=_activation_autotune_configs(),
+    key=['D'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def elu_p1_bwd_kernel(
+    x, dy, dx,
+    stride_x_row,
+    stride_dy_row,
+    stride_dx_row,
+    T,
+    D: tl.constexpr,
+    B: tl.constexpr,
+):
+    i_n = tl.program_id(0).to(tl.int64)
+    offs = i_n * B + tl.arange(0, B)
+    mask = offs < T
+    row = offs // D
+    col = offs % D
+    b_x = tl.load(x + row * stride_x_row + col, mask=mask, other=0.).to(tl.float32)
+    b_dy = tl.load(dy + row * stride_dy_row + col, mask=mask, other=0.).to(tl.float32)
+    b_dx = b_dy * tldevice.exp(tl.minimum(b_x, 0.))
+    tl.store(dx + row * stride_dx_row + col, b_dx.to(dx.dtype.element_ty), mask=mask)
+
+
+@dispatch('modules')
+def elu_p1_fwd(x: torch.Tensor) -> torch.Tensor:
+    x = x.contiguous() if x.ndim < 2 else _ensure_inner_contiguous(x)
+    T, D = x.numel(), x.shape[-1] if x.ndim else 1
+    y = _alloc_output(x)
+    if T > 0:
+        elu_p1_fwd_kernel[lambda meta: (triton.cdiv(T, meta['B']),)](
+            x=x,
+            y=y,
+            stride_x_row=_get_stride(x),
+            stride_y_row=_get_stride(y),
+            T=T,
+            D=D,
+        )
+    return y
+
+
+@dispatch('modules')
+def elu_p1_bwd(x: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
+    x = x.contiguous() if x.ndim < 2 else _ensure_inner_contiguous(x)
+    dy = dy.contiguous() if dy.ndim < 2 else _ensure_inner_contiguous(dy)
+    T, D = x.numel(), x.shape[-1] if x.ndim else 1
+    dx = _alloc_output(x)
+    if T > 0:
+        elu_p1_bwd_kernel[lambda meta: (triton.cdiv(T, meta['B']),)](
+            x=x,
+            dy=dy,
+            dx=dx,
+            stride_x_row=_get_stride(x),
+            stride_dy_row=_get_stride(dy),
+            stride_dx_row=_get_stride(dx),
+            T=T,
+            D=D,
+        )
+    return dx
+
+
+class ELUPlusOneFunction(torch.autograd.Function):
+
+    @staticmethod
+    @input_guard(no_guard_contiguous=True)
+    @autocast_custom_fwd
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return elu_p1_fwd(x)
+
+    @staticmethod
+    @input_guard(no_guard_contiguous=True)
+    @autocast_custom_bwd
+    def backward(ctx, dout):
+        x, = ctx.saved_tensors
+        return elu_p1_bwd(x, dout)
+
+
+def elu_p1(x: torch.Tensor) -> torch.Tensor:
+    """Compute ELU + 1 without cancellation in the negative branch."""
+    # triton-ascend 3.2.2 does not implement libdevice.exp
+    if IS_NPU or x.device.type == 'cpu' or x.dtype == torch.float64:
+        return torch.where(x >= 0, x + 1, x.clamp_max(0).exp()).to(x.dtype)
+    return ELUPlusOneFunction.apply(x)
+
+
+@triton.autotune(
+    configs=_activation_autotune_configs(),
     key=['D'],
     **autotune_cache_kwargs,
 )
@@ -232,11 +350,7 @@ def logsigmoid_fwd_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({'B': bs}, num_warps=num_warps)
-        for bs in [512, 1024, 2048, 4096, 8192]
-        for num_warps in NUM_WARPS_AUTOTUNE
-    ],
+    configs=_activation_autotune_configs(),
     key=['D'],
     **autotune_cache_kwargs,
 )
@@ -265,7 +379,6 @@ def logsigmoid_bwd_kernel(
 
 
 @dispatch('modules')
-@torch.compiler.disable
 def logsigmoid_fwd(x: torch.Tensor, temperature: float = 1., output_contiguous: bool = False) -> torch.Tensor:
     x = _ensure_inner_contiguous(x)
     T, D = x.numel(), x.shape[-1]
@@ -283,7 +396,6 @@ def logsigmoid_fwd(x: torch.Tensor, temperature: float = 1., output_contiguous: 
 
 
 @dispatch('modules')
-@torch.compiler.disable
 def logsigmoid_bwd(
     x: torch.Tensor,
     dy: torch.Tensor,
@@ -329,11 +441,7 @@ def logsigmoid(x: torch.Tensor, temperature: float = 1.) -> torch.Tensor:
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({'B': bs}, num_warps=num_warps)
-        for bs in [512, 1024, 2048, 4096, 8192]
-        for num_warps in NUM_WARPS_AUTOTUNE
-    ],
+    configs=_activation_autotune_configs(),
     key=['D'],
     **autotune_cache_kwargs,
 )
@@ -357,11 +465,7 @@ def swish_fwd_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({'B': bs}, num_warps=num_warps)
-        for bs in [512, 1024, 2048, 4096, 8192]
-        for num_warps in NUM_WARPS_AUTOTUNE
-    ],
+    configs=_activation_autotune_configs(),
     key=['D'],
     **autotune_cache_kwargs,
 )
@@ -388,7 +492,6 @@ def swish_bwd_kernel(
 
 
 @dispatch('modules')
-@torch.compiler.disable
 def swish_fwd(x: torch.Tensor, output_contiguous: bool = False) -> torch.Tensor:
     x = _ensure_inner_contiguous(x)
     T, D = x.numel(), x.shape[-1]
@@ -405,7 +508,6 @@ def swish_fwd(x: torch.Tensor, output_contiguous: bool = False) -> torch.Tensor:
 
 
 @dispatch('modules')
-@torch.compiler.disable
 def swish_bwd(x: torch.Tensor, dy: torch.Tensor, output_contiguous: bool = False) -> torch.Tensor:
     x = _ensure_inner_contiguous(x)
     dy = _ensure_inner_contiguous(dy)
@@ -559,11 +661,7 @@ sqrelu = SquaredReLUFunction.apply
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({'B': bs}, num_warps=num_warps)
-        for bs in [512, 1024, 2048, 4096, 8192]
-        for num_warps in NUM_WARPS_AUTOTUNE
-    ],
+    configs=_activation_autotune_configs(),
     key=['D'],
     **autotune_cache_kwargs,
 )
@@ -592,11 +690,7 @@ def swiglu_fwd_kernel(
     'HAS_WEIGHT': lambda args: args['z'] is not None,
 })
 @triton.autotune(
-    configs=[
-        triton.Config({'B': bs}, num_warps=num_warps)
-        for bs in [512, 1024, 2048, 4096, 8192]
-        for num_warps in NUM_WARPS_AUTOTUNE
-    ],
+    configs=_activation_autotune_configs(),
     key=['D'],
     **autotune_cache_kwargs,
 )
@@ -636,7 +730,6 @@ def swiglu_fwdbwd_kernel(
 
 
 @dispatch('modules')
-@torch.compiler.disable
 def swiglu_fwd(x: torch.Tensor, y: torch.Tensor, output_contiguous: bool = False) -> torch.Tensor:
     assert x.shape == y.shape, f"swiglu_fwd: shape mismatch x={x.shape} y={y.shape}"
     x = _ensure_inner_contiguous(x)
@@ -657,7 +750,6 @@ def swiglu_fwd(x: torch.Tensor, y: torch.Tensor, output_contiguous: bool = False
 
 
 @dispatch('modules')
-@torch.compiler.disable
 def swiglu_fwdbwd(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -760,11 +852,7 @@ def swiglu_linear(x, y, weight, bias):
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({'B': bs}, num_warps=num_warps)
-        for bs in [512, 1024, 2048, 4096, 8192]
-        for num_warps in NUM_WARPS_AUTOTUNE
-    ],
+    configs=_activation_autotune_configs(),
     key=['D'],
     **autotune_cache_kwargs,
 )
@@ -793,11 +881,7 @@ def sigmoidglu_fwd_kernel(
     'HAS_WEIGHT': lambda args: args['z'] is not None,
 })
 @triton.autotune(
-    configs=[
-        triton.Config({'B': bs}, num_warps=num_warps)
-        for bs in [512, 1024, 2048, 4096, 8192]
-        for num_warps in NUM_WARPS_AUTOTUNE
-    ],
+    configs=_activation_autotune_configs(),
     key=['D'],
     **autotune_cache_kwargs,
 )
@@ -956,11 +1040,7 @@ sigmoidglu_linear = SigmoidGLULinearFunction.apply
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({'B': bs}, num_warps=num_warps)
-        for bs in [512, 1024, 2048, 4096, 8192]
-        for num_warps in NUM_WARPS_AUTOTUNE
-    ],
+    configs=_activation_autotune_configs(),
     key=['D'],
     **autotune_cache_kwargs,
 )
@@ -998,11 +1078,7 @@ def powglu_fwd_kernel(
     'HAS_WEIGHT': lambda args: args['z'] is not None,
 })
 @triton.autotune(
-    configs=[
-        triton.Config({'B': bs}, num_warps=num_warps)
-        for bs in [512, 1024, 2048, 4096, 8192]
-        for num_warps in NUM_WARPS_AUTOTUNE
-    ],
+    configs=_activation_autotune_configs(),
     key=['D'],
     **autotune_cache_kwargs,
 )
@@ -1058,7 +1134,7 @@ def powglu_fwdbwd_kernel(
         tl.store(z + row * stride_z_row + col, b_z.to(z.dtype.element_ty), mask=mask)
 
 
-@torch.compiler.disable
+@dispatch('modules')
 def powglu_fwd(x: torch.Tensor, y: torch.Tensor, power: float = 3.0, output_contiguous: bool = False) -> torch.Tensor:
     assert x.shape == y.shape, f"powglu_fwd: shape mismatch x={x.shape} y={y.shape}"
     x = _ensure_inner_contiguous(x)
@@ -1079,7 +1155,7 @@ def powglu_fwd(x: torch.Tensor, y: torch.Tensor, power: float = 3.0, output_cont
     return z
 
 
-@torch.compiler.disable
+@dispatch('modules')
 def powglu_fwdbwd(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -1186,6 +1262,7 @@ def powglu(x: torch.Tensor, y: torch.Tensor, power: float = 3.0) -> torch.Tensor
     return PowGLUFunction.apply(x, y, power)
 
 
+@dispatch('modules')
 def powglu_linear(
     x: torch.Tensor,
     y: torch.Tensor,

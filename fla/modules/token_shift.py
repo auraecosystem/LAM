@@ -10,9 +10,12 @@ import triton
 import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
-from fla.utils import IS_AMD, autotune_cache_kwargs, get_multiprocessor_count, input_guard, tensor_cache
+from fla.utils import IS_AMD, IS_NPU, autotune_cache_kwargs, get_multiprocessor_count, input_guard, tensor_cache
 
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [2, 4, 8, 16, 32]
+# Ascend Triton rejects 2-D grids whose product exceeds 65535 unless
+# TRITON_ALL_BLOCKS_PARALLEL=1. Fall back to the long kernel instead.
+_NPU_MAX_TRITON_GRID = 65535
 
 
 def token_shift_ref(
@@ -79,11 +82,11 @@ def token_shift_fwd_kernel_short(
     STORE_FINAL_STATE: tl.constexpr,
     IS_DECODE: tl.constexpr,
 ):
-    i_b, i_t = tl.program_id(0), tl.program_id(1)
+    i_b, i_t = tl.program_id(0).to(tl.int64), tl.program_id(1)
 
     if IS_VARLEN:
         i_n = i_b
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         g_t = i_t + bos
 
         if g_t >= eos:
@@ -127,6 +130,9 @@ def token_shift_fwd_kernel_short(
             tl.store(y + base_offset, delta, mask=m_d)
         else:
             tl.store(y + base_offset, -b_x, mask=m_d)
+        if STORE_FINAL_STATE:
+            if is_last_pos:
+                tl.store(cache_out + cache_offset, b_x, mask=m_d)
         return
 
     # Other positions: delta = prev - curr
@@ -174,13 +180,13 @@ def token_shift_fwd_kernel_long(
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
 ):
-    i_dt, i_b = tl.program_id(0), tl.program_id(1)
+    i_dt, i_b = tl.program_id(0), tl.program_id(1).to(tl.int64)
     i_d, i_t = i_dt % ND, i_dt // ND
 
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), \
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n), tl.load(cu_seqlens + i_n + 1)
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         t_start = i_t * BT
         t_end = tl.minimum(t_start + BT, eos - bos)
     else:
@@ -246,11 +252,11 @@ def token_shift_bwd_kernel_short(
     USE_INITIAL_STATE: tl.constexpr,
     HAS_DCACHE: tl.constexpr,
 ):
-    i_b, i_t = tl.program_id(0), tl.program_id(1)
+    i_b, i_t = tl.program_id(0).to(tl.int64), tl.program_id(1)
 
     if IS_VARLEN:
         i_n = i_b
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         g_t = i_t + bos
         if g_t >= eos:
             return
@@ -328,13 +334,13 @@ def token_shift_bwd_kernel_long(
     USE_INITIAL_STATE: tl.constexpr,
     HAS_DCACHE: tl.constexpr,
 ):
-    i_dt, i_b = tl.program_id(0), tl.program_id(1)
+    i_dt, i_b = tl.program_id(0), tl.program_id(1).to(tl.int64)
     i_d, i_t_blk = i_dt % ND, i_dt // ND
 
     if IS_VARLEN:
         i_n, i_t_blk = tl.load(chunk_indices + i_t_blk * 2).to(tl.int32), \
-            tl.load(chunk_indices + i_t_blk * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n), tl.load(cu_seqlens + i_n + 1)
+            tl.load(chunk_indices + i_t_blk * 2 + 1).to(tl.int64)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         t_start = i_t_blk * BT
         t_end = tl.minimum(t_start + BT, eos - bos)
     else:
@@ -391,6 +397,8 @@ def token_shift_fwd(
         N = B
 
     use_short_kernel = T <= 4096
+    if IS_NPU and use_short_kernel and N * T > _NPU_MAX_TRITON_GRID:
+        use_short_kernel = False
 
     if output_cache:
         cache_out = torch.empty((N, D), device=x.device, dtype=x.dtype)
@@ -404,7 +412,7 @@ def token_shift_fwd(
             N = B
         BD = triton.next_power_of_2(D)
         grid = (N, T)
-        IS_DECODE = T == 1 or (B == 1 and T == N)
+        IS_DECODE = T == 1
         token_shift_fwd_kernel_short[grid](
             x=x,
             y=y,

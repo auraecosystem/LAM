@@ -1,0 +1,394 @@
+name: ascend-a2-benchmark-ci
+
+# Pinned stack: CANN 9.1.0 image + pyproject [npu] extra
+# (torch 2.9.0 / torch_npu 2.9.0.post6 / torchvision 0.24.0 / triton-ascend 3.2.2)
+# Runs NPU performance benchmarks for triton-ascend backends and causal conv.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "**/*.py"
+      - "pyproject.toml"
+      - ".github/workflows/*.yml"
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, edited]
+    paths:
+      - "**/*.py"
+      - "pyproject.toml"
+      - ".github/workflows/*.yml"
+
+jobs:
+  changes:
+    name: Detect NPU-related changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      npu_related: ${{ steps.detect.outputs.npu_related }}
+    steps:
+      - name: Detect NPU-related diff
+        id: detect
+        uses: actions/github-script@v9.0.0
+        with:
+          script: |
+            if (context.eventName !== 'pull_request') {
+              core.setOutput('npu_related', 'false');
+              return;
+            }
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: pr.number, per_page: 100,
+            });
+            // NPU-related set: triton-ascend backend files, Ascend workflow
+            // definitions, the files that define the NPU CI stack itself:
+            //   pyproject.toml    - pins the [npu] extra (torch_npu / triton-ascend)
+            //   fla/backends.py   - shared dispatch machinery
+            //   fla/utils/        - IS_NPU / device_platform detection, ascend_ub_manager
+            //   fla/modules/      - pure-torch modules run on NPU in the A2 test suite
+            //   tests/conftest.py - FLA_NPU_XDIST xdist worker -> device mapping
+            // and the benchmark harness invoked by this workflow (benchmarks/).
+            // Unlike the H100 'npu_only' detection, __init__.py is NOT excluded
+            // here: a change to it affects the NPU backend too, so it should
+            // trigger this CI.
+            const npuPattern = /^fla\/(.+\/)?backends\/triton_ascend\/|^\.github\/workflows\/ascend-|^pyproject\.toml$|^fla\/backends\.py$|^fla\/utils\/|^fla\/modules\/|^tests\/conftest\.py$|^benchmarks\//;
+            const related = files.filter(f => npuPattern.test(f.filename)).map(f => f.filename);
+            if (related.length > 0) {
+              core.info('NPU-related files changed: ' + related.join(', '));
+            }
+            core.setOutput('npu_related', related.length > 0 ? 'true' : 'false');
+
+  benchmark-a2-npu-pytorch-2-9:
+    name: Benchmark A2 NPU (PyTorch 2.9.0)
+    needs: changes
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      (
+        github.event_name == 'pull_request' &&
+        (
+          needs.changes.outputs.npu_related == 'true' ||
+          contains(github.event.pull_request.title, 'npu') ||
+          contains(github.event.pull_request.title, 'NPU') ||
+          contains(github.event.pull_request.title, 'ascend') ||
+          contains(github.event.pull_request.title, 'Ascend') ||
+          contains(github.event.pull_request.title, 'ASCEND')
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        python:
+          - "3.12"
+        os:
+          - "linux-aarch64-a2-4"
+
+    runs-on: ${{ matrix.os }}
+
+    timeout-minutes: 150
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.os }}-${{ matrix.python }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+    container:
+      image: ascendai/cann:9.1.0-910b-ubuntu22.04-py3.12
+      options: >-
+        --shm-size 16g
+      env:
+        HF_ENDPOINT: https://hf-mirror.com
+
+    env:
+      FLA_CI_ENV: 1
+      ASCEND_RT_VISIBLE_DEVICES: "0,1,2,3"
+      # Triton perf_report always calls plt.savefig when save_path is set.
+      MPLBACKEND: Agg
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Check NPU and CANN info
+        run: |
+          cat /usr/local/Ascend/ascend-toolkit/latest/"$(uname -m)"-linux/ascend_toolkit_install.info
+          npu-smi info
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip setuptools wheel
+          # triton-ascend runtime/build deps; install before resolving [npu] extra
+          python -m pip install pybind11 cmake attrs sympy pyyaml scipy decorator einops
+          # benchmark_conv plotting (Triton perf_report + benchmarks.visualize).
+          python -m pip install matplotlib pandas
+          # [npu] extra pins torch / torch_npu / torchvision / triton-ascend; osinfra index
+          # hosts triton-ascend wheels (see INSTALL.md).
+          python -m pip install ".[npu,test]" \
+            --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
+
+      - name: Verify environment
+        shell: bash
+        run: |
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          python - <<'PY'
+          import torch
+          import torch_npu
+
+          print("torch:", torch.__version__)
+          print("torch_npu:", torch_npu.__version__)
+          print("npu available:", torch.npu.is_available())
+
+          import triton
+          print("triton:", triton.__version__)
+
+          from fla.utils import IS_NPU, device_platform
+          print("device_platform:", device_platform)
+          assert IS_NPU, "Expected NPU backend (IS_NPU=True)"
+
+          import matplotlib
+          import pandas as pd
+          print("matplotlib:", matplotlib.__version__, "| backend:", matplotlib.get_backend())
+          print("pandas:", pd.__version__)
+
+          import io
+          import matplotlib.pyplot as plt
+          fig, _ax = plt.subplots()
+          fig.savefig(io.BytesIO(), format='png')
+          plt.close(fig)
+          print("matplotlib savefig smoke test: ok")
+          PY
+
+      - name: Repeat PR 1347 varlen graph comparison on the same NPU
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          BASE_REF: 07ca1e49ef6ca76a7f0dbc8d5ad040ab59434c38
+          HEAD_REF: 92c06df0c5136572b7c8e5c1f8cb2296c68fb3fa
+          ASCEND_RT_VISIBLE_DEVICES: "0"
+          FLA_CI_ENV: "0"
+          FLA_DISABLE_BACKEND_DISPATCH: "0"
+        run: |
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          set -euo pipefail
+          result_root="$GITHUB_WORKSPACE/benchmark_comparison"
+          mkdir -p "$result_root/base" "$result_root/head"
+          npu-smi info > "$result_root/npu-smi.txt"
+          for repo_root in "$GITHUB_WORKSPACE" "$RUNNER_TEMP/fla-pr1347-base" "$RUNNER_TEMP/fla-pr1347-head"; do
+            git config --global --add safe.directory "$repo_root"
+          done
+          git worktree add --detach "$RUNNER_TEMP/fla-pr1347-base" "$BASE_REF"
+          git worktree add --detach "$RUNNER_TEMP/fla-pr1347-head" "$HEAD_REF"
+
+          for round in 1 2 3; do
+            labels=(base head)
+            if [[ "$round" == 2 ]]; then
+              labels=(head base)
+            fi
+            for label in "${labels[@]}"; do
+              repo_root="$RUNNER_TEMP/fla-pr1347-$label"
+              output_dir="$result_root/$label"
+              (
+                cd "$repo_root"
+                export PYTHONPATH="$repo_root"
+                git rev-parse HEAD > "$output_dir/commit.txt"
+                python - <<'PY' > "$output_dir/import-$round.txt"
+          import os
+          import socket
+          from pathlib import Path
+
+          import torch
+
+          import fla
+          from fla.utils import IS_NPU
+
+          assert Path(fla.__file__).resolve().parent.parent == Path.cwd()
+          assert IS_NPU and torch.npu.device_count() == 1
+          assert os.environ['ASCEND_RT_VISIBLE_DEVICES'] == '0'
+          torch.npu.set_device(0)
+          print('source:', fla.__file__)
+          print('hostname:', socket.gethostname())
+          print('device:', torch.npu.current_device(), torch.npu.get_device_name(0))
+          for name in ('ASCEND_RT_VISIBLE_DEVICES', 'ASCEND_VISIBLE_DEVICES'):
+              print(name, os.environ.get(name))
+          PY
+                python -m benchmarks.ops.run --graph --op chunk_kda --no-base \
+                  --custom-shapes '{"varlen": {"B": 1, "T": 128, "H": 2, "D": 64, "N": 2}}' \
+                  --engines eager graph --modes fwdbwd --warmup 10 --iterations 200 \
+                  --json "$output_dir/varlen-$round.json" > "$output_dir/varlen-$round.log" 2>&1
+              )
+            done
+          done
+
+          python - <<'PY'
+          import json
+          import math
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['GITHUB_WORKSPACE']) / 'benchmark_comparison'
+          hostnames = set()
+          for label in ('base', 'head'):
+              path = root / label
+              assert (path / 'commit.txt').read_text().strip() == os.environ[f'{label.upper()}_REF']
+              for round in (1, 2, 3):
+                  current = json.loads((path / f'varlen-{round}.json').read_text())['current']
+                  info = current['machine_info']
+                  assert info['device_platform'] == 'npu' and info['gpu_count'] == 1
+                  hostnames.add(info['hostname'])
+                  rows = current['results']
+                  assert len(rows) == 1
+                  row = rows[0]
+                  assert row['op'] == 'chunk_kda' and row['mode'] == 'fwdbwd'
+                  assert tuple(row[k] for k in ('B', 'T', 'H', 'D', 'N')) == (1, 128, 2, 64, 2)
+                  assert row['validation'] == 'passed'
+                  for engine in ('eager', 'graph'):
+                      assert all(
+                          math.isfinite(row[engine][key]) and row[engine][key] > 0
+                          for key in ('p50_ms', 'p95_ms', 'mean_ms', 'min_ms')
+                      )
+          assert len(hostnames) == 1, hostnames
+          print('Both refs completed three alternating varlen graph rounds on the same NPU.')
+          PY
+
+      - name: Benchmark chunk_gdn, fused_recurrent_gdn2, chunk_gdn2, chunk_kda, KDA graph, fused_attnres, and conv1d
+        if: github.event_name != 'workflow_dispatch'
+        shell: bash
+        env:
+          FLA_BENCH_WARMUP_MS: "25"
+          FLA_BENCH_REP_MS: "100"
+          FLA_BENCH_OP_WARMUP_ITERS: "3"
+        run: |
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          set -uo pipefail
+
+          run_benchmark() {
+            local name=$1 device=$2
+            shift 2
+            local started=$SECONDS rc=0
+            echo "Benchmark $name: device=$device started=$(date -u +%FT%TZ)"
+            ASCEND_RT_VISIBLE_DEVICES="$device" "$@" > "$name.log" 2>&1 || rc=$?
+            echo "Benchmark $name: device=$device elapsed=$((SECONDS - started))s exit=$rc"
+            return "$rc"
+          }
+
+          (
+            status=0
+            run_benchmark chunk_gdn 0 python -m benchmarks.ops.run \
+              --op chunk_gdn --base '' --json benchmark_chunk_gdn.json || status=1
+            run_benchmark fused_recurrent_gdn2 0 python -m benchmarks.ops.run \
+              --op fused_recurrent_gdn2 --base '' --json benchmark_fused_recurrent_gdn2.json || status=1
+            exit "$status"
+          ) &
+          pid_gdn=$!
+          run_benchmark chunk_kda 1 python -m benchmarks.ops.run \
+            --op chunk_kda --base '' --json benchmark_chunk_kda.json &
+          pid_kda=$!
+          # fused_attnres finishes first in the four-card baseline; reuse its card for GDN2.
+          (
+            set -e
+            run_benchmark fused_attnres 2 python -m benchmarks.ops.run \
+              --op fused_attnres --base '' --json benchmark_fused_attnres.json
+            run_benchmark chunk_gdn2 2 python -m benchmarks.ops.run \
+              --op chunk_gdn2 --base '' \
+              --json benchmark_chunk_gdn2.json
+          python - <<'PY'
+          import json
+
+          from benchmarks.ops.registry import SHAPE_CONFIGS, get_op
+
+          def verify(path, shapes):
+              with open(path) as f:
+                  results = [r for r in json.load(f)['results'] if r['op'] == 'chunk_gdn2']
+              actual = {(r['mode'], r['B'], r['T'], r['H'], r['D']) for r in results}
+              expected = {
+                  (mode, shape['B'], shape['T'], shape['H'], shape['D'])
+                  for shape in shapes.values()
+                  for mode in ('fwd', 'fwdbwd')
+              }
+              assert len(results) == len(expected) and actual == expected, {
+                  'missing': sorted(expected - actual),
+                  'unexpected': sorted(actual - expected),
+              }
+
+          shapes = get_op('chunk_gdn2').default_shapes or SHAPE_CONFIGS
+          verify('benchmark_chunk_gdn2.json', shapes)
+          PY
+          ) &
+          pid_attnres=$!
+          run_benchmark conv1d 3 python benchmarks/modules/benchmark_conv.py &
+          pid_conv1d=$!
+          status=0
+          wait "$pid_gdn" || status=1
+          wait "$pid_kda" || status=1
+          wait "$pid_attnres" || status=1
+          wait "$pid_conv1d" || status=1
+
+          # The runner exposes devices 0-3. Reuse device 0 only after the
+          # parallel benchmarks finish so graph latency is not affected by
+          # another workload sharing the same NPU.
+          ASCEND_RT_VISIBLE_DEVICES=0 python -m benchmarks.ops.run --graph \
+            --op chunk_kda --no-base --modes fwdbwd \
+            --custom-shapes '{"smoke": {"B": 1, "T": 128, "H": 2, "D": 64, "N": 2}}' \
+            --warmup 3 --iterations 10 --json benchmark_kda_graph.json \
+            > chunk_kda_graph.log 2>&1 || status=1
+
+          echo "========== chunk_gdn =========="
+          cat chunk_gdn.log
+          echo "========== fused_recurrent_gdn2 =========="
+          cat fused_recurrent_gdn2.log
+          echo "========== chunk_gdn2 (default shape matrix, including 32K) =========="
+          cat chunk_gdn2.log
+          echo "========== chunk_kda =========="
+          cat chunk_kda.log
+          echo "========== fused_attnres =========="
+          cat fused_attnres.log
+          echo "========== chunk_kda graph =========="
+          cat chunk_kda_graph.log
+          echo "========== conv1d =========="
+          cat conv1d.log
+          exit "$status"
+
+      - name: Check fused-recurrent GDN2 benchmark results
+        if: github.event_name != 'workflow_dispatch'
+        shell: bash
+        run: |
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          python - <<'PY'
+          import json
+          import math
+
+          from benchmarks.ops.registry import SHAPE_CONFIGS, get_op
+
+          with open("benchmark_fused_recurrent_gdn2.json") as f:
+              results = json.load(f)["results"]
+          config = get_op("fused_recurrent_gdn2")
+          shapes = config.default_shapes or SHAPE_CONFIGS
+          expected = {tuple(shape[key] for key in ("B", "T", "H", "D")) for shape in shapes.values()}
+          actual = {tuple(row[key] for key in ("B", "T", "H", "D")) for row in results}
+          assert actual == expected and len(results) == len(expected), f"Incomplete GDN2 benchmark: {actual} != {expected}"
+          for row in results:
+              assert row["op"] == "fused_recurrent_gdn2" and row["mode"] == "fwd", row
+              assert all(math.isfinite(row[key]) and row[key] > 0 for key in ("median_ms", "p20_ms", "p80_ms")), row
+          PY
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ascend-a2-benchmark-results
+          path: |
+            benchmark_chunk_gdn.json
+            benchmark_fused_recurrent_gdn2.json
+            benchmark_chunk_gdn2.json
+            benchmark_chunk_kda.json
+            benchmark_fused_attnres.json
+            benchmark_kda_graph.json
+            conv_benchmark/
+            benchmark_comparison/
+          if-no-files-found: ignore
+          retention-days: 10

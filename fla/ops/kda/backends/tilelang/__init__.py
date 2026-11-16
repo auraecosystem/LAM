@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import torch
 
-from fla.ops.backends import BaseBackend
+from fla.backends import BaseBackend, register_backend
+from fla.utils import has_usable_nvcc
 
 
+@register_backend('kda')
 class KDATileLangBackend(BaseBackend):
 
     backend_type = "tilelang"
@@ -22,11 +24,7 @@ class KDATileLangBackend(BaseBackend):
 
     @classmethod
     def is_available(cls) -> bool:
-        try:
-            import tilelang  # noqa: F401
-            return True
-        except ImportError:
-            return False
+        return super().is_available() and has_usable_nvcc()
 
     def chunk_kda_bwd_wy_dqkg_fused_verifier(
         self,

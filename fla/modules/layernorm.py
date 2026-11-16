@@ -10,9 +10,7 @@
 # Implement residual + layer_norm / rms_norm.
 
 # Based on the Triton LayerNorm tutorial: https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html
-# For the backward pass, we keep weight_grad and bias_grad in registers and accumulate.
-# This is faster for dimensions up to 8k, but after that it's much slower due to register spilling.
-# The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
+# accumulate affine gradients in registers; wide dimensions can cause register spilling.
 
 from __future__ import annotations
 
@@ -29,7 +27,7 @@ from torch.distributed.tensor import Replicate, Shard, distribute_module
 from torch.distributed.tensor.parallel import ParallelStyle
 
 from fla.modules.backends import dispatch
-from fla.utils import autotune_cache_kwargs, get_multiprocessor_count, input_guard
+from fla.utils import IS_INTEL, autotune_cache_kwargs, get_multiprocessor_count, input_guard
 
 try:
     from torch.distributed.tensor import DTensor
@@ -41,7 +39,7 @@ def layer_norm_ref(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
-    residual: torch.Tensor = None,
+    residual: torch.Tensor | None = None,
     eps: float = 1e-5,
     prenorm: bool = False,
     upcast: bool = False,
@@ -65,7 +63,7 @@ def rms_norm_ref(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
-    residual: torch.Tensor = None,
+    residual: torch.Tensor | None = None,
     eps: float = 1e-5,
     prenorm: bool = False,
     upcast: bool = False,
@@ -90,7 +88,7 @@ def group_norm_ref(
     weight: torch.Tensor,
     bias: torch.Tensor,
     num_groups: int,
-    residual: torch.Tensor = None,
+    residual: torch.Tensor | None = None,
     eps: float = 1e-5,
     is_rms_norm: bool = False,
     prenorm: bool = False,
@@ -131,7 +129,7 @@ class GroupNormRef(nn.Module):
         bias: bool = False,
         eps: float = 1e-5,
         is_rms_norm: bool = False,
-    ) -> GroupNormRef:
+    ) -> None:
         super().__init__()
 
         if hidden_size % num_groups != 0:
@@ -170,9 +168,9 @@ class GroupNormRef(nn.Module):
 
     def forward(self, x, residual=None, prenorm=False):
         return group_norm_ref(
-            x,
-            self.weight,
-            self.bias,
+            x=x,
+            weight=self.weight,
+            bias=self.bias,
             num_groups=self.num_groups,
             residual=residual,
             eps=self.eps,
@@ -191,17 +189,17 @@ class GroupNormRef(nn.Module):
     key=['D', 'NB', 'HAS_RESIDUAL', 'STORE_RESIDUAL_OUT', 'IS_RMS_NORM'],
     **autotune_cache_kwargs,
 )
-@triton.jit
+@triton.jit(do_not_specialize=['T'])
 def layer_norm_fwd_kernel(
-    x,  # pointer to the input
-    y,  # pointer to the output
-    w,  # pointer to the weights
-    b,  # pointer to the biases
-    res,  # pointer to the res
-    res_out,  # pointer to the res
-    mean,  # pointer to the mean
-    rstd,  # pointer to the 1/std
-    eps,  # epsilon to avoid division by zero
+    x,
+    y,
+    w,
+    b,
+    res,
+    res_out,
+    mean,
+    rstd,
+    eps,
     T,
     G: tl.constexpr,
     D: tl.constexpr,
@@ -214,25 +212,27 @@ def layer_norm_fwd_kernel(
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
+    i_t = tl.program_id(0).to(tl.int64)
 
     o_t = i_t * BT + tl.arange(0, BT)
     o_g = o_t % G
     o_d = tl.arange(0, BD)
     m_d = o_d < D
+    m_t = o_t < T
+    m_x = m_t[:, None] & m_d[None, :]
 
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    p_x = x + o_t[:, None] * D + o_d[None, :]
+    b_x = tl.load(p_x, mask=m_x, other=0.0).to(tl.float32)
     if HAS_RESIDUAL:
-        p_res = tl.make_block_ptr(res, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-        b_x += tl.load(p_res, boundary_check=(0, 1)).to(tl.float32)
+        p_res = res + o_t[:, None] * D + o_d[None, :]
+        b_x += tl.load(p_res, mask=m_x, other=0.0).to(tl.float32)
     if STORE_RESIDUAL_OUT:
-        p_res_out = tl.make_block_ptr(res_out, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-        tl.store(p_res_out, b_x.to(p_res_out.dtype.element_ty), boundary_check=(0, 1))
+        p_res_out = res_out + o_t[:, None] * D + o_d[None, :]
+        tl.store(p_res_out, b_x.to(p_res_out.dtype.element_ty), mask=m_x)
     if not IS_RMS_NORM:
         b_mean = tl.sum(b_x, axis=1) / D
-        p_mean = tl.make_block_ptr(mean, (T,), (1,), (i_t * BT,), (BT,), (0,))
-        tl.store(p_mean, b_mean.to(p_mean.dtype.element_ty), boundary_check=(0,))
+        p_mean = mean + o_t
+        tl.store(p_mean, b_mean.to(p_mean.dtype.element_ty), mask=m_t)
         b_xbar = tl.where(m_d[None, :], b_x - b_mean[:, None], 0.0)
         b_var = tl.sum(b_xbar * b_xbar, axis=1) / D
     else:
@@ -240,8 +240,8 @@ def layer_norm_fwd_kernel(
         b_var = tl.sum(b_xbar * b_xbar, axis=1) / D
     b_rstd = 1 / tl.sqrt(b_var + eps)
 
-    p_rstd = tl.make_block_ptr(rstd, (T,), (1,), (i_t * BT,), (BT,), (0,))
-    tl.store(p_rstd, b_rstd.to(p_rstd.dtype.element_ty), boundary_check=(0,))
+    p_rstd = rstd + o_t
+    tl.store(p_rstd, b_rstd.to(p_rstd.dtype.element_ty), mask=m_t)
 
     if HAS_WEIGHT:
         b_w = tl.load(w + o_g[:, None] * D + o_d[None, :], mask=m_d[None, :]).to(tl.float32)
@@ -252,9 +252,8 @@ def layer_norm_fwd_kernel(
     if HAS_BIAS:
         b_y = b_y + b_b
 
-    # Write output
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    p_y = y + o_t[:, None] * D + o_d[None, :]
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), mask=m_x)
 
 
 @triton.autotune(
@@ -266,16 +265,16 @@ def layer_norm_fwd_kernel(
     **autotune_cache_kwargs,
 )
 @triton.jit
-def layer_norm_fwd_kernel1(
-    x,  # pointer to the input
-    y,  # pointer to the output
-    w,  # pointer to the weights
-    b,  # pointer to the biases
-    res,  # pointer to the res
-    res_out,  # pointer to the res
-    mean,  # pointer to the mean
-    rstd,  # pointer to the 1/std
-    eps,  # epsilon to avoid division by zero
+def layer_norm_fwd_kernel_row(
+    x,
+    y,
+    w,
+    b,
+    res,
+    res_out,
+    mean,
+    rstd,
+    eps,
     G: tl.constexpr,
     D: tl.constexpr,
     BD: tl.constexpr,
@@ -285,7 +284,7 @@ def layer_norm_fwd_kernel1(
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
+    i_t = tl.program_id(0).to(tl.int64)
     i_g = i_t % G
 
     x += i_t * D
@@ -322,7 +321,6 @@ def layer_norm_fwd_kernel1(
     if HAS_BIAS:
         b_y = b_y + b_b
 
-    # Write output
     tl.store(y + o_d, b_y, mask=m_d)
 
 
@@ -338,16 +336,16 @@ def layer_norm_fwd_kernel1(
     key=['D', 'NB', 'HAS_DRESIDUAL', 'STORE_DRESIDUAL', 'IS_RMS_NORM'],
     **autotune_cache_kwargs,
 )
-@triton.jit
+@triton.jit(do_not_specialize=['T'])
 def layer_norm_bwd_kernel(
-    x,  # pointer to the input
-    w,  # pointer to the weights
-    b,  # pointer to the biases
-    y,  # pointer to the output to be recomputed
-    dy,  # pointer to the output gradient
-    dx,  # pointer to the input gradient
-    dw,  # pointer to the partial sum of weights gradient
-    db,  # pointer to the partial sum of biases gradient
+    x,
+    w,
+    b,
+    y,
+    dy,
+    dx,
+    dw,
+    db,
     dres,
     dres_in,
     mean,
@@ -367,7 +365,7 @@ def layer_norm_bwd_kernel(
     HAS_BIAS: tl.constexpr,
     RECOMPUTE_OUTPUT: tl.constexpr,
 ):
-    i_s = tl.program_id(0)
+    i_s = tl.program_id(0).to(tl.int64)
     i_g, i_sg = i_s // GS, i_s % GS
 
     o_d = tl.arange(0, BD)
@@ -379,26 +377,27 @@ def layer_norm_bwd_kernel(
         b_b = tl.load(b + i_g * D + o_d, mask=m_d, other=0.0).to(tl.float32)
         b_db = tl.zeros((BT, BD), dtype=tl.float32)
 
-    # Tg: number of tokens per group, used as the logical shape for make_block_ptr.
-    # for mean/rstd with shape (T,) and stride (G,), the strided view has Tg elements per group.
-    # the caller guarantees NS capped so every program has work.
-    # the last program's range may slightly exceed Tg (since BS = cdiv(T, NS));
-    # boundary_check handles the partial tail tile, m_t < Tg masks dw/db accumulation.
+    # tokens are interleaved by group in x, mean, and rstd.
     Tg = T // G
     for i_t in range(i_sg * BS, i_sg * BS + BS, BT):
-        p_x = tl.make_block_ptr(x + i_g * D, (Tg, D), (G*D, 1), (i_t, 0), (BT, BD), (1, 0))
-        p_dy = tl.make_block_ptr(dy + i_g * D, (Tg, D), (G*D, 1), (i_t, 0), (BT, BD), (1, 0))
-        p_dx = tl.make_block_ptr(dx + i_g * D, (Tg, D), (G*D, 1), (i_t, 0), (BT, BD), (1, 0))
+        o_t = (i_t + tl.arange(0, BT)).to(tl.int64)
+        m_t = o_t < Tg
+        m_x = m_t[:, None] & m_d[None, :]
+        m_o = o_t < min(i_sg * BS + BS, Tg)
+        m_ox = m_o[:, None] & m_d[None, :]
+        p_x = x + i_g * D + o_t[:, None] * (G*D) + o_d[None, :]
+        p_dy = dy + i_g * D + o_t[:, None] * (G*D) + o_d[None, :]
+        p_dx = dx + i_g * D + o_t[:, None] * (G*D) + o_d[None, :]
         # [BT, BD]
-        b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
-        b_dy = tl.load(p_dy, boundary_check=(0, 1)).to(tl.float32)
+        b_x = tl.load(p_x, mask=m_x, other=0.0).to(tl.float32)
+        b_dy = tl.load(p_dy, mask=m_x, other=0.0).to(tl.float32)
 
         if not IS_RMS_NORM:
-            p_mean = tl.make_block_ptr(mean + i_g, (Tg,), (G,), (i_t,), (BT,), (0,))
-            b_mean = tl.load(p_mean, boundary_check=(0,))
-        p_rstd = tl.make_block_ptr(rstd + i_g, (Tg,), (G,), (i_t,), (BT,), (0,))
-        b_rstd = tl.load(p_rstd, boundary_check=(0,))
-        # Compute dx
+            p_mean = mean + i_g + o_t * G
+            b_mean = tl.load(p_mean, mask=m_t, other=0.0)
+        p_rstd = rstd + i_g + o_t * G
+        b_rstd = tl.load(p_rstd, mask=m_t, other=0.0)
+
         b_xhat = (b_x - b_mean[:, None]) * b_rstd[:, None] if not IS_RMS_NORM else b_x * b_rstd[:, None]
         b_xhat = tl.where(m_d[None, :], b_xhat, 0.0)
 
@@ -406,20 +405,16 @@ def layer_norm_bwd_kernel(
         if HAS_BIAS:
             b_y = b_y + b_b[None, :]
         if RECOMPUTE_OUTPUT:
-            p_y = tl.make_block_ptr(y + i_g * D, (Tg, D), (G*D, 1), (i_t, 0), (BT, BD), (1, 0))
-            tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+            p_y = y + i_g * D + o_t[:, None] * (G*D) + o_d[None, :]
+            tl.store(p_y, b_y.to(p_y.dtype.element_ty), mask=m_ox)
 
         b_wdy = b_dy
 
-        if HAS_WEIGHT or HAS_BIAS:
-            # when BT > BS, a tile may span into the next program's range;
-            # mask to this program's upper bound to avoid double-counting dw/db.
-            m_t = (i_t + tl.arange(0, BT)) < min(i_sg * BS + BS, Tg)
         if HAS_WEIGHT:
             b_wdy = b_dy * b_w
-            b_dw += tl.where(m_t[:, None], b_dy * b_xhat, 0.0)
+            b_dw += tl.where(m_o[:, None], b_dy * b_xhat, 0.0)
         if HAS_BIAS:
-            b_db += tl.where(m_t[:, None], b_dy, 0.0)
+            b_db += tl.where(m_o[:, None], b_dy, 0.0)
         if not IS_RMS_NORM:
             b_c1 = tl.sum(b_xhat * b_wdy, axis=1) / D
             b_c2 = tl.sum(b_wdy, axis=1) / D
@@ -428,15 +423,15 @@ def layer_norm_bwd_kernel(
             b_c1 = tl.sum(b_xhat * b_wdy, axis=1) / D
             b_dx = (b_wdy - b_xhat * b_c1[:, None]) * b_rstd[:, None]
         if HAS_DRESIDUAL:
-            p_dres = tl.make_block_ptr(dres + i_g * D, (Tg, D), (G*D, 1), (i_t, 0), (BT, BD), (1, 0))
-            b_dres = tl.load(p_dres, boundary_check=(0, 1)).to(tl.float32)
+            p_dres = dres + i_g * D + o_t[:, None] * (G*D) + o_d[None, :]
+            b_dres = tl.load(p_dres, mask=m_x, other=0.0).to(tl.float32)
             b_dx += b_dres
-        # Write dx
-        if STORE_DRESIDUAL:
-            p_dres_in = tl.make_block_ptr(dres_in + i_g * D, (Tg, D), (G*D, 1), (i_t, 0), (BT, BD), (1, 0))
-            tl.store(p_dres_in, b_dx.to(p_dres_in.dtype.element_ty), boundary_check=(0, 1))
 
-        tl.store(p_dx, b_dx.to(p_dx.dtype.element_ty), boundary_check=(0, 1))
+        if STORE_DRESIDUAL:
+            p_dres_in = dres_in + i_g * D + o_t[:, None] * (G*D) + o_d[None, :]
+            tl.store(p_dres_in, b_dx.to(p_dres_in.dtype.element_ty), mask=m_ox)
+
+        tl.store(p_dx, b_dx.to(p_dx.dtype.element_ty), mask=m_ox)
 
     if HAS_WEIGHT:
         tl.store(dw + i_s * D + o_d, tl.sum(b_dw, axis=0), mask=m_d)
@@ -455,16 +450,16 @@ def layer_norm_bwd_kernel(
     key=['D', 'HAS_DRESIDUAL', 'STORE_DRESIDUAL', 'IS_RMS_NORM'],
     **autotune_cache_kwargs,
 )
-@triton.jit
-def layer_norm_bwd_kernel1(
-    x,  # pointer to the input
-    w,  # pointer to the weights
-    b,  # pointer to the biases
-    y,  # pointer to the output to be recomputed
-    dy,  # pointer to the output gradient
-    dx,  # pointer to the input gradient
-    dw,  # pointer to the partial sum of weights gradient
-    db,  # pointer to the partial sum of biases gradient
+@triton.jit(do_not_specialize=['T'])
+def layer_norm_bwd_kernel_row(
+    x,
+    w,
+    b,
+    y,
+    dy,
+    dx,
+    dw,
+    db,
     dres,
     dres_in,
     mean,
@@ -482,7 +477,7 @@ def layer_norm_bwd_kernel1(
     HAS_BIAS: tl.constexpr,
     RECOMPUTE_OUTPUT: tl.constexpr,
 ):
-    i_s = tl.program_id(0)
+    i_s = tl.program_id(0).to(tl.int64)
     i_g, i_sg = i_s // GS, i_s % GS
 
     o_d = tl.arange(0, BD)
@@ -503,7 +498,7 @@ def layer_norm_bwd_kernel1(
         if not IS_RMS_NORM:
             b_mean = tl.load(mean + i_t)
         b_rstd = tl.load(rstd + i_t)
-        # Compute dx
+
         b_xhat = (b_x - b_mean) * b_rstd if not IS_RMS_NORM else b_x * b_rstd
         b_xhat = tl.where(mask, b_xhat, 0.0)
         if RECOMPUTE_OUTPUT:
@@ -527,7 +522,7 @@ def layer_norm_bwd_kernel1(
         if HAS_DRESIDUAL:
             b_dres = tl.load(dres + i_t * D + o_d, mask=mask, other=0).to(tl.float32)
             b_dx += b_dres
-        # Write dx
+
         b_dx = tl.cast(b_dx, dtype=dx.dtype.element_ty, fp_downcast_rounding='rtne')
         if STORE_DRESIDUAL:
             tl.store(dres_in + i_t * D + o_d, b_dx, mask=mask)
@@ -545,9 +540,9 @@ def layer_norm_fwd(
     weight: torch.Tensor,
     bias: torch.Tensor,
     eps: float = 1e-5,
-    residual: torch.Tensor = None,
-    out_dtype: torch.dtype = None,
-    residual_dtype: torch.dtype = None,
+    residual: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    residual_dtype: torch.dtype | None = None,
     is_rms_norm: bool = False,
     num_groups: int = 1,
 ):
@@ -560,7 +555,7 @@ def layer_norm_fwd(
         assert weight.shape == (G * D,)
     if bias is not None:
         assert bias.shape == (G * D,)
-    # allocate output
+
     y = torch.empty_like(x, dtype=x.dtype if out_dtype is None else out_dtype)
     if residual is not None or (residual_dtype is not None and residual_dtype != x.dtype):
         res_out = torch.empty(T, D, device=x.device, dtype=residual_dtype)
@@ -568,26 +563,28 @@ def layer_norm_fwd(
         res_out = None
     mean = torch.empty((T,), dtype=torch.float, device=x.device) if not is_rms_norm else None
     rstd = torch.empty((T,), dtype=torch.float, device=x.device)
-    # Less than 64KB per feature: enqueue fused kernel
+
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
     if D > BD:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    # heuristics for number of warps
-
-    if D <= 512:
+    # use the row kernel at D == 512 to fit Intel scratch-space limits.
+    if D <= 512 and not (D == 512 and IS_INTEL):
         NB = triton.cdiv(T, 2048)
-        def grid(meta): return (triton.cdiv(T, meta['BT']), )
+
+        def grid(meta):
+            return (triton.cdiv(T, meta['BT']),)
+
         layer_norm_fwd_kernel[grid](
-            x,
-            y,
-            weight,
-            bias,
-            residual,
-            res_out,
-            mean,
-            rstd,
-            eps,
+            x=x,
+            y=y,
+            w=weight,
+            b=bias,
+            res=residual,
+            res_out=res_out,
+            mean=mean,
+            rstd=rstd,
+            eps=eps,
             T=T,
             G=G,
             D=D,
@@ -600,16 +597,16 @@ def layer_norm_fwd(
             HAS_BIAS=bias is not None,
         )
     else:
-        layer_norm_fwd_kernel1[(T,)](
-            x,
-            y,
-            weight,
-            bias,
-            residual,
-            res_out,
-            mean,
-            rstd,
-            eps,
+        layer_norm_fwd_kernel_row[(T,)](
+            x=x,
+            y=y,
+            w=weight,
+            b=bias,
+            res=residual,
+            res_out=res_out,
+            mean=mean,
+            rstd=rstd,
+            eps=eps,
             G=G,
             D=D,
             BD=BD,
@@ -629,12 +626,12 @@ def layer_norm_bwd(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
-    mean: torch.Tensor = None,
-    rstd: torch.Tensor = None,
-    dres: torch.Tensor = None,
+    mean: torch.Tensor | None = None,
+    rstd: torch.Tensor | None = None,
+    dres: torch.Tensor | None = None,
     has_residual: bool = False,
     is_rms_norm: bool = False,
-    x_dtype: torch.dtype = None,
+    x_dtype: torch.dtype | None = None,
     recompute_output: bool = False,
     num_groups: int = 1,
 ):
@@ -646,20 +643,16 @@ def layer_norm_bwd(
         assert weight.shape == (G * D,)
     if bias is not None:
         assert bias.shape == (G * D,)
-    # allocate output
+
     dx = torch.empty_like(x) if x_dtype is None else torch.empty(T, D, dtype=x_dtype, device=x.device)
     dres_in = torch.empty_like(x) if has_residual and dx.dtype != x.dtype else None
     y = torch.empty(T, D, dtype=dy.dtype, device=dy.device) if recompute_output else None
 
-    # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
     if D > BD:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    # each program handles one group only.
-    # cap per-group program count to T // G so no program is completely idle.
-    # without this, high-SM GPUs (e.g. B200, 160 SMs) with small T would
-    # launch idle programs whose make_block_ptr offsets exceed the tensor shape.
+    # cap the per-group program count for short sequences.
     NS = min(triton.cdiv(get_multiprocessor_count(x.device.index), G), T // G) * G
     BS = triton.cdiv(T, NS)
     GS = NS // G
@@ -668,21 +661,22 @@ def layer_norm_bwd(
     db = torch.empty((NS, D), dtype=torch.float, device=bias.device) if bias is not None else None
     grid = (NS,)
 
-    if D <= 512:
+    # use the row kernel at D == 512 to fit Intel scratch-space limits.
+    if D <= 512 and not (D == 512 and IS_INTEL):
         NB = triton.cdiv(T, 2048)
         layer_norm_bwd_kernel[grid](
-            x,
-            weight,
-            bias,
-            y,
-            dy,
-            dx,
-            dw,
-            db,
-            dres,
-            dres_in,
-            mean,
-            rstd,
+            x=x,
+            w=weight,
+            b=bias,
+            y=y,
+            dy=dy,
+            dx=dx,
+            dw=dw,
+            db=db,
+            dres=dres,
+            dres_in=dres_in,
+            mean=mean,
+            rstd=rstd,
             T=T,
             G=G,
             D=D,
@@ -697,19 +691,19 @@ def layer_norm_bwd(
             HAS_BIAS=bias is not None,
         )
     else:
-        layer_norm_bwd_kernel1[grid](
-            x,
-            weight,
-            bias,
-            y,
-            dy,
-            dx,
-            dw,
-            db,
-            dres,
-            dres_in,
-            mean,
-            rstd,
+        layer_norm_bwd_kernel_row[grid](
+            x=x,
+            w=weight,
+            b=bias,
+            y=y,
+            dy=dy,
+            dx=dx,
+            dw=dw,
+            db=db,
+            dres=dres,
+            dres_in=dres_in,
+            mean=mean,
+            rstd=rstd,
             T=T,
             G=G,
             D=D,
@@ -724,7 +718,7 @@ def layer_norm_bwd(
         )
     dw = dw.view(G, -1, D).sum(1).to(weight).view_as(weight) if weight is not None else None
     db = db.view(G, -1, D).sum(1).to(bias).view_as(bias) if bias is not None else None
-    # Don't need to compute dres_in separately in this case
+    # reuse dx when the residual gradient has the same dtype.
     if has_residual and dx.dtype == x.dtype:
         dres_in = dx
     return (dx, dw, db, dres_in) if not recompute_output else (dx, dw, db, dres_in, y)
@@ -739,7 +733,7 @@ class LayerNormFunction(torch.autograd.Function):
         x,
         weight,
         bias,
-        residual: torch.Tensor = None,
+        residual: torch.Tensor | None = None,
         eps: float = 1e-5,
         prenorm: bool = False,
         residual_in_fp32: bool = False,
@@ -750,7 +744,7 @@ class LayerNormFunction(torch.autograd.Function):
 
         if x.shape[-1] % num_groups != 0:
             raise ValueError('num_channels must be divisible by num_groups')
-        # reshape input data into 2D tensor
+
         x = x.reshape(-1, (x.shape[-1] // num_groups))
         if residual is not None:
             assert residual.shape == x_shape_og
@@ -761,11 +755,11 @@ class LayerNormFunction(torch.autograd.Function):
             else (torch.float32 if residual_in_fp32 else None)
         )
         y, mean, rstd, res_out = layer_norm_fwd(
-            x,
-            weight,
-            bias,
-            eps,
-            residual,
+            x=x,
+            weight=weight,
+            bias=bias,
+            eps=eps,
+            residual=residual,
             residual_dtype=residual_dtype,
             is_rms_norm=is_rms_norm,
             num_groups=num_groups,
@@ -794,15 +788,15 @@ class LayerNormFunction(torch.autograd.Function):
         else:
             dresidual = None
         dx, dw, db, dresidual_in = layer_norm_bwd(
-            dy,
-            x,
-            weight,
-            bias,
-            mean,
-            rstd,
-            dresidual,
-            ctx.has_residual,
-            ctx.is_rms_norm,
+            dy=dy,
+            x=x,
+            weight=weight,
+            bias=bias,
+            mean=mean,
+            rstd=rstd,
+            dres=dresidual,
+            has_residual=ctx.has_residual,
+            is_rms_norm=ctx.is_rms_norm,
             x_dtype=ctx.x_dtype,
             num_groups=ctx.num_groups,
         )
@@ -823,7 +817,7 @@ def layer_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
-    residual: torch.Tensor = None,
+    residual: torch.Tensor | None = None,
     eps: float = 1e-5,
     prenorm: bool = False,
     residual_in_fp32: bool = False,
@@ -845,7 +839,7 @@ def group_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
-    residual: torch.Tensor = None,
+    residual: torch.Tensor | None = None,
     eps: float = 1e-5,
     prenorm: bool = False,
     residual_in_fp32: bool = False,
@@ -869,7 +863,7 @@ def rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
-    residual: torch.Tensor = None,
+    residual: torch.Tensor | None = None,
     eps: float = 1e-5,
     prenorm: bool = False,
     residual_in_fp32: bool = False,
@@ -892,7 +886,7 @@ def layer_norm_linear(
     norm_bias: torch.Tensor,
     linear_weight: torch.Tensor,
     linear_bias: torch.Tensor,
-    residual: torch.Tensor = None,
+    residual: torch.Tensor | None = None,
     eps: float = 1e-5,
     prenorm: bool = False,
     residual_in_fp32: bool = False,
@@ -920,7 +914,7 @@ def rms_norm_linear(
     norm_bias: torch.Tensor,
     linear_weight: torch.Tensor,
     linear_bias: torch.Tensor,
-    residual: torch.Tensor = None,
+    residual: torch.Tensor | None = None,
     eps: float = 1e-5,
     prenorm: bool = False,
     residual_in_fp32: bool = False,
@@ -945,7 +939,7 @@ def group_norm_linear(
     norm_bias: torch.Tensor,
     linear_weight: torch.Tensor,
     linear_bias: torch.Tensor,
-    residual: torch.Tensor = None,
+    residual: torch.Tensor | None = None,
     eps: float = 1e-5,
     prenorm: bool = False,
     residual_in_fp32: bool = False,
@@ -977,7 +971,7 @@ class LayerNorm(nn.Module):
         eps: float = 1e-5,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> LayerNorm:
+    ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
@@ -1010,9 +1004,9 @@ class LayerNorm(nn.Module):
 
     def forward(self, x, residual=None, prenorm=False, residual_in_fp32=False):
         return layer_norm(
-            x,
-            self.weight,
-            self.bias,
+            x=x,
+            weight=self.weight,
+            bias=self.bias,
             residual=residual,
             eps=self.eps,
             prenorm=prenorm,
@@ -1032,7 +1026,7 @@ class GroupNorm(nn.Module):
         is_rms_norm: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> GroupNorm:
+    ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
@@ -1072,9 +1066,9 @@ class GroupNorm(nn.Module):
 
     def forward(self, x, residual=None, prenorm=False, residual_in_fp32=False):
         return group_norm(
-            x,
-            self.weight,
-            self.bias,
+            x=x,
+            weight=self.weight,
+            bias=self.bias,
             residual=residual,
             eps=self.eps,
             prenorm=prenorm,
@@ -1094,7 +1088,7 @@ class RMSNorm(nn.Module):
         eps: float = 1e-5,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> RMSNorm:
+    ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
@@ -1127,9 +1121,9 @@ class RMSNorm(nn.Module):
 
     def forward(self, x, residual=None, prenorm=False, residual_in_fp32=False):
         return rms_norm(
-            x,
-            self.weight,
-            self.bias,
+            x=x,
+            weight=self.weight,
+            bias=self.bias,
             residual=residual,
             eps=self.eps,
             prenorm=prenorm,
@@ -1159,7 +1153,7 @@ class LayerNormLinearFunction(torch.autograd.Function):
 
         if x.shape[-1] % num_groups != 0:
             raise ValueError('num_channels must be divisible by num_groups')
-        # reshape input data into 2D tensor
+
         x = x.reshape(-1, (x.shape[-1] // num_groups))
         if residual is not None:
             assert residual.shape == x_shape_og
@@ -1170,11 +1164,11 @@ class LayerNormLinearFunction(torch.autograd.Function):
             else (torch.float32 if residual_in_fp32 else None)
         )
         y, mean, rstd, res_out = layer_norm_fwd(
-            x,
-            norm_weight,
-            norm_bias,
-            eps,
-            residual,
+            x=x,
+            weight=norm_weight,
+            bias=norm_bias,
+            eps=eps,
+            residual=residual,
             out_dtype=None if not torch.is_autocast_enabled() else torch.get_autocast_gpu_dtype(),
             residual_dtype=residual_dtype,
             is_rms_norm=is_rms_norm,
@@ -1185,7 +1179,7 @@ class LayerNormLinearFunction(torch.autograd.Function):
         linear_weight = linear_weight.to(dtype)
         linear_bias = linear_bias.to(dtype) if linear_bias is not None else None
         out = F.linear(y.to(linear_weight.dtype), linear_weight, linear_bias)
-        # We don't store y, will be recomputed in the backward pass to save memory
+        # recompute y in backward to save memory.
         ctx.save_for_backward(res_out, norm_weight, norm_bias, linear_weight, mean, rstd)
         ctx.x_shape_og = x_shape_og
         ctx.eps = eps
@@ -1213,15 +1207,15 @@ class LayerNormLinearFunction(torch.autograd.Function):
         else:
             dresidual = None
         dx, dnorm_weight, dnorm_bias, dresidual_in, y = layer_norm_bwd(
-            dy,
-            x,
-            norm_weight,
-            norm_bias,
-            mean,
-            rstd,
-            dresidual,
-            ctx.has_residual,
-            ctx.is_rms_norm,
+            dy=dy,
+            x=x,
+            weight=norm_weight,
+            bias=norm_bias,
+            mean=mean,
+            rstd=rstd,
+            dres=dresidual,
+            has_residual=ctx.has_residual,
+            is_rms_norm=ctx.is_rms_norm,
             x_dtype=ctx.x_dtype,
             recompute_output=True,
             num_groups=ctx.num_groups,
@@ -1246,13 +1240,13 @@ class LayerNormLinear(nn.Module):
 
     def __init__(
         self,
-        hidden_size,
+        hidden_size: int,
         elementwise_affine: bool = True,
         bias: bool = False,
         eps: float = 1e-5,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> LayerNormLinear:
+    ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
@@ -1310,7 +1304,7 @@ class GroupNormLinear(nn.Module):
         is_rms_norm: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> GroupNormLinear:
+    ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
@@ -1368,13 +1362,13 @@ class RMSNormLinear(nn.Module):
 
     def __init__(
         self,
-        hidden_size,
+        hidden_size: int,
         elementwise_affine: bool = True,
         bias: bool = False,
         eps: float = 1e-5,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> RMSNormLinear:
+    ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
