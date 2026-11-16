@@ -50,19 +50,14 @@ def parallel_path_fwd_kernel(
     i_h = i_hq // G
 
     if IS_VARLEN:
-        i_n, i_t = tl.load(indices + i_t * 2).to(tl.int32), tl.load(indices + i_t * 2 + 1).to(tl.int64)
+        i_n, i_t = tl.load(indices + i_t * 2).to(tl.int32), tl.load(indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = (eos - bos).to(tl.int32)
     else:
         i_n = i_b
         bos, eos = (i_n * T).to(tl.int64), (i_n * T + T).to(tl.int64)
 
-    o_q = i_t * BT + tl.arange(0, BT)
-    o_d = tl.arange(0, BK)
-    o_v = tl.arange(0, BV)
-    m_q = o_q < T
-    m_o = m_q[:, None] & (o_v[None, :] < V)
-    p_q = q + (bos * HQ + i_hq) * K + o_q[:, None] * (HQ*K) + o_d[None, :]
+    p_q = tl.make_block_ptr(q + (bos * HQ + i_hq) * K, (T, K), (HQ*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     b_q = tl.zeros([BT, BK], dtype=tl.float32)
     b_q += tl.load(p_q, mask=m_q[:, None] & (o_d[None, :] < K), other=0.0)
     sm_scale = scale * 1.44269504

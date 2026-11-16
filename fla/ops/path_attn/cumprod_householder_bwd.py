@@ -47,6 +47,8 @@ def chunk_cumprod_householder_bwd_kernel(
         bos, eos = (i_n * T).to(tl.int64), (i_n * T + T).to(tl.int64)
         boh = (i_n * tl.cdiv(T, BT)).to(tl.int64)
         boh_large = (i_n * tl.cdiv(T, S)).to(tl.int64)
+        boh = i_n * tl.cdiv(T, BT)
+        boh_large = i_n * tl.cdiv(T, S)
 
     # offset calculations
     dhc_whole += ((boh_large + i_s) * HQ + i_hq) * K * K

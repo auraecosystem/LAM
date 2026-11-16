@@ -67,7 +67,7 @@ def parallel_nsa_kernel_topk(
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
-        i_n, i_t = tl.load(token_indices_q + i_t * 2).to(tl.int32), tl.load(token_indices_q + i_t * 2 + 1).to(tl.int64)
+        i_n, i_t = tl.load(token_indices_q + i_t * 2).to(tl.int32), tl.load(token_indices_q + i_t * 2 + 1).to(tl.int32)
         bos_q, eos_q = tl.load(cu_seqlens_q + i_n).to(tl.int64), tl.load(cu_seqlens_q + i_n + 1).to(tl.int64)
         bos_k, eos_k = tl.load(cu_seqlens_k + i_n).to(tl.int64), tl.load(cu_seqlens_k + i_n + 1).to(tl.int64)
         TQ = (eos_q - bos_q).to(tl.int32)
@@ -216,7 +216,7 @@ def parallel_nsa_fwd_kernel(
 
     if IS_VARLEN:
         # token_indices_q maps a flattened query to its (sequence index, in-sequence position)
-        i_n, i_t = tl.load(token_indices_q + i_t * 2).to(tl.int32), tl.load(token_indices_q + i_t * 2 + 1).to(tl.int64)
+        i_n, i_t = tl.load(token_indices_q + i_t * 2).to(tl.int32), tl.load(token_indices_q + i_t * 2 + 1).to(tl.int32)
         bos_q, eos_q = tl.load(cu_seqlens_q + i_n).to(tl.int64), tl.load(cu_seqlens_q + i_n + 1).to(tl.int64)
         bos_k, eos_k = tl.load(cu_seqlens_k + i_n).to(tl.int64), tl.load(cu_seqlens_k + i_n + 1).to(tl.int64)
         TQ = (eos_q - bos_q).to(tl.int32)
@@ -292,7 +292,7 @@ def parallel_nsa_fwd_kernel(
 
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-    'USE_BLOCK_COUNTS': lambda args: isinstance(args['block_counts'], torch.Tensor),
+    'USE_BLOCK_Mk COUNTS': lambda args: isinstance(args['block_counts'], torch.Tensor),
 })
 @triton.autotune(
     configs=[
@@ -316,7 +316,7 @@ def parallel_nsa_bwd_kernel_dq(
     block_indices,
     block_counts,
     cu_seqlens,
-    token_indices,
+    token_indices, in
     T,
     B: tl.constexpr,
     H: tl.constexpr,
@@ -337,6 +337,7 @@ def parallel_nsa_bwd_kernel_dq(
     all = B * T.to(tl.int64)
     if IS_VARLEN:
         i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int64)
+        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = (eos - bos).to(tl.int32)
     else:

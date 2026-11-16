@@ -56,6 +56,7 @@ def parallel_nsa_compression_fwd_kernel(
 
     if IS_VARLEN:
         i_n, i_t = tl.load(token_indices_q + i_t * 2).to(tl.int32), tl.load(token_indices_q + i_t * 2 + 1).to(tl.int64)
+        i_n, i_t = tl.load(token_indices_q + i_t * 2).to(tl.int32), tl.load(token_indices_q + i_t * 2 + 1).to(tl.int32)
         bos_q, eos_q = tl.load(cu_seqlens_q + i_n).to(tl.int64), tl.load(cu_seqlens_q + i_n + 1).to(tl.int64)
         bos_k, eos_k = tl.load(cu_seqlens_k + i_n).to(tl.int64), tl.load(cu_seqlens_k + i_n + 1).to(tl.int64)
         TQ = (eos_q - bos_q).to(tl.int32)
@@ -166,10 +167,10 @@ def parallel_nsa_compression_bwd_kernel_dq(
 
     all = B * T.to(tl.int64)
     if IS_VARLEN:
-        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int64)
+        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(token_indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = (eos - bos).to(tl.int32)
-        boc = tl.load(chunk_offsets + i_n).to(tl.int64)
+        boc = tl.load(chunk_offsets + i_n).to(tl.int32)
     else:
         bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
         boc = i_b * tl.cdiv(T, BS)
@@ -314,6 +315,9 @@ def parallel_nsa_compression_bwd_kernel_dkv(
         i_n, i_c = tl.load(chunk_indices + i_c * 2).to(tl.int64), tl.load(chunk_indices + i_c * 2 + 1).to(tl.int64)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
+        i_n, i_c = tl.load(chunk_indices + i_c * 2).to(tl.int32), tl.load(chunk_indices + i_c * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T = (eos - bos).to(tl.int32)
         # the number of compression representations in total
         TC = tl.cdiv(T, BS)
         boc = tl.load(chunk_offsets + i_n).to(tl.int64)
