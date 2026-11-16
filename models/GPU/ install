@@ -1,3 +1,4 @@
+#!/bin/bash/env python
 $ MODEL='fla-hub/gla-1.3B-100B'
 $ python -m fla.modules --model hf \
     --model_args pretrained=$MODEL,dtype=bfloat16 \
@@ -5,4 +6,4 @@ $ python -m fla.modules --model hf \
     --batch_size 64 \
     --num_fewshot 0 \
     --device cuda \
-    --show_config
+    --show_confi
