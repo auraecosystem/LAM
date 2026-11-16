@@ -7,3 +7,5 @@ $ accelerate launch -m evals.harness \
     --batch_size 2 \
     --show_config  \
     --trust_remote_code
+
+>>> from lm_eval.tasks import TaskManager; TaskManager().initialize_tasks()
