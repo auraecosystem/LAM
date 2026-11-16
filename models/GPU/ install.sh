@@ -1,5 +1,5 @@
 $ MODEL='fla-hub/gla-1.3B-100B'
-$ python -m evals.harness --model hf \
+$ python -m fla.modules --model hf \
     --model_args pretrained=$MODEL,dtype=bfloat16 \
     --tasks wikitext,lambada_openai,piqa,hellaswag,winogrande,arc_easy,arc_challenge,boolq,sciq,copa,openbookqa \
     --batch_size 64 \
