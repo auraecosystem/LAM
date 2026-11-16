@@ -1,3 +1,10 @@
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+
 import torch
 import triton
 import triton.language as tl
@@ -33,8 +40,8 @@ def chunk_cumprod_householder_fwd_kernel(
 
     if IS_VARLEN:
         i_n, i_s = tl.load(split_indices + i_ss * 2).to(tl.int32), tl.load(split_indices + i_ss * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T = (eos - bos).to(tl.int32)
         NS = tl.cdiv(T, S)
 
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
@@ -42,7 +49,7 @@ def chunk_cumprod_householder_fwd_kernel(
     else:
         NS = tl.cdiv(T, S)
         i_n, i_s = i_ss // NS, i_ss % NS
-        bos, eos = i_n * T, i_n * T + T
+        bos, eos = (i_n * T).to(tl.int64), (i_n * T + T).to(tl.int64)
 
         boh = i_n * tl.cdiv(T, BT)
         boh_large = i_n * tl.cdiv(T, S)
@@ -86,10 +93,13 @@ def chunk_cumprod_householder_fwd_fn(
     S: int,  # split size, aka large chunk size
     BT: int,  # small chunk size
     cu_seqlens: torch.Tensor = None,
+    chunk_indices: torch.LongTensor | None = None,
 ):
     B, T, H, K = k.shape
 
-    split_indices = prepare_chunk_indices(cu_seqlens, S) if cu_seqlens is not None else None
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, S)
+    split_indices = chunk_indices
     chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT) if cu_seqlens is not None else None
     split_offsets = prepare_chunk_offsets(cu_seqlens, S) if cu_seqlens is not None else None
 

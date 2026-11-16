@@ -1,3 +1,9 @@
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 from __future__ import annotations
 
@@ -17,7 +23,7 @@ if TYPE_CHECKING:
 
     from fla.models.utils import Cache
 
-from fla.layers.utils import get_unpad_data, index_first_axis, pad_input, unpad_input
+from fla.layers.utils import get_layer_cache, get_unpad_data, index_first_axis, pad_input, unpad_input, update_layer_cache
 
 
 def _upad_input(
@@ -403,7 +409,7 @@ class MomAttention(nn.Module):
             self.g_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
             self.o_norm = FusedRMSNormGated(self.head_v_dim, eps=norm_eps)
         else:
-            self.o_norm = RMSNorm(self.head_v_dim, eps=norm_eps)
+            self.o_norm = RMSNorm(self.head_v_dim, eps=norm_eps, dtype=torch.float32)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
         self.apply(self._initialize_weights)
 
@@ -441,10 +447,8 @@ class MomAttention(nn.Module):
         if self.training:
             assert mode == 'chunk', "Only chunk mode is supported in training."
 
-        last_state = None
+        last_state = get_layer_cache(self, past_key_values)
         # _, q_len = hidden_states.shape[0], hidden_states.shape[1]
-        if past_key_values is not None and len(past_key_values) > self.layer_idx:
-            last_state = past_key_values[self.layer_idx]
 
         # 🔍 topk gating
         router_logits = self.gate(hidden_states)  # (bsz, q_len, num_memories)
@@ -581,6 +585,7 @@ class MomAttention(nn.Module):
                 initial_state=recurrent_state[0],
                 output_final_state=use_cache,
                 use_qk_l2norm_in_kernel=True,
+                state_v_first=True,
                 cu_seqlens=cu_seqlens,
             )
             recurrent_state[0] = self.handle_recurrent_state(
@@ -606,6 +611,7 @@ class MomAttention(nn.Module):
                 initial_state=memories,
                 output_final_state=use_cache,
                 use_qk_l2norm_in_kernel=True,
+                state_v_first=True,
                 cu_seqlens=cu_seqlens,
             )
             recurrent_state[0] = self.handle_recurrent_state(
@@ -628,13 +634,13 @@ class MomAttention(nn.Module):
                                      use_cache, conv_state_q, conv_state_k, conv_state_v)
             o += shared_o
 
-        if past_key_values is not None:
-            past_key_values.update(
-                recurrent_state=recurrent_state,
-                conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
-                layer_idx=self.layer_idx,
-                offset=q.shape[2],
-            )
+        update_layer_cache(
+            self,
+            past_key_values,
+            recurrent_state=recurrent_state,
+            conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
+            offset=q.shape[2],
+        )
 
         if self.use_output_gate:
             g = rearrange(self.g_proj(shared_hidden_states), '... (h d) -> ... h d', d=self.head_v_dim)
@@ -715,8 +721,9 @@ class MomAttention(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state[-1],
                 output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=True,
+                state_v_first=True,
+                cu_seqlens=cu_seqlens,
             )
         elif mode == 'fused_recurrent':
             o, recurrent_state[-1] = fused_recurrent_gated_delta_rule(
@@ -727,8 +734,9 @@ class MomAttention(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state[-1],
                 output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=True,
+                state_v_first=True,
+                cu_seqlens=cu_seqlens,
             )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")

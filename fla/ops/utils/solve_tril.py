@@ -1,4 +1,9 @@
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import os
 
@@ -41,7 +46,7 @@ def solve_tril_16x16_kernel(
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -61,15 +66,18 @@ def solve_tril_16x16_kernel(
         p_A = tl.make_block_ptr(A, (T, BT), (H*BT, 1), (i_t * 16, offset), (16, 16), (1, 0))
         # [16, 16]
         b_A = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
+        b_A = tl.where(m_A, b_A, 0)
     else:
         desc = make_tensor_descriptor(A, [T, BT], [H*BT, 1], [16, 16])
         desc_o = make_tensor_descriptor(Ai, [T, 16], [H*16, 1], [16, 16])
         b_A = desc.load([i_t * 16, offset]).to(tl.float32)
-    b_A = -tl.where(m_A, b_A, 0)
+        b_A = tl.where(m_A, b_A, 0)
+    b_A = -b_A
 
     for i in range(2, min(16, T - i_t * 16)):
         # [16]
         b_a = -tl.load(A + (i_t * 16 + i) * H*BT + o_i + offset)
+        b_a = tl.where(o_i < i, b_a, 0.)
         b_a = b_a + tl.sum(b_a[:, None] * b_A, 0)
         b_A = tl.where((o_i == i)[:, None], b_a, b_A)
     b_A += m_I
@@ -106,7 +114,7 @@ def merge_16x16_to_32x32_inverse_kernel(
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -195,7 +203,7 @@ def merge_16x16_to_64x64_inverse_kernel(
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -235,18 +243,22 @@ def merge_16x16_to_64x64_inverse_kernel(
 
     for i in range(2, min(16, T - i_t * BT)):
         b_a_11 = -tl.load(A + (i_t * BT + i) * H*BT + o_i)
+        b_a_11 = tl.where(o_i < i, b_a_11, 0.)
         b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
         b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
     for i in range(16 + 2, min(32, T - i_t * BT)):
         b_a_22 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 16)
+        b_a_22 = tl.where(o_i < i - 16, b_a_22, 0.)
         b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
         b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
     for i in range(32 + 2, min(48, T - i_t * BT)):
         b_a_33 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 32)
+        b_a_33 = tl.where(o_i < i - 32, b_a_33, 0.)
         b_a_33 += tl.sum(b_a_33[:, None] * b_Ai_33, 0)
         b_Ai_33 = tl.where((o_i == i - 32)[:, None], b_a_33, b_Ai_33)
     for i in range(48 + 2, min(64, T - i_t * BT)):
         b_a_44 = -tl.load(A + (i_t * BT + i) * H*BT + o_i + 48)
+        b_a_44 = tl.where(o_i < i - 48, b_a_44, 0.)
         b_a_44 += tl.sum(b_a_44[:, None] * b_Ai_44, 0)
         b_Ai_44 = tl.where((o_i == i - 48)[:, None], b_a_44, b_Ai_44)
     b_Ai_11 += m_I
